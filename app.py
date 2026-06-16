@@ -31,7 +31,7 @@ if not st.session_state['logged_in']:
     st.markdown("---")
     st.subheader("작업자 전용 인증")
     
-    input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 4자리 입력")
+    input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 8자리 입력")
     
     if st.button("🔓 시스템 접속하기"):
         if input_pw == ACCESS_PASSWORD:
