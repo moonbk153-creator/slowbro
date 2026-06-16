@@ -8,7 +8,7 @@ st.set_page_config(page_title="색도 관리 시스템", layout="wide")
 
 EXCEL_FILE = 'data sheet.xlsx'
 DB_FILE = 'color_management.db'
-EQUIPMENT_LIST = ["버닝", "태환 12KG", "프로밧 25KG", "뷸러 60KG", "뷸러 120KG"]
+EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
 ADMIN_PASSWORD = "0322"
 
 # ==========================================
