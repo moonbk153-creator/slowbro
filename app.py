@@ -12,9 +12,10 @@ EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸
 ADMIN_PASSWORD = "0322"
 
 # ==========================================
-# [새로운 기능] 직원용 공용 접속 비밀번호 설정
+# [새로운 기능] 공장 직원용 공용 접속 비밀번호 설정
 # ==========================================
-ACCESS_PASSWORD = "27000833"
+# Streamlit 클라우드의 비밀 금고(Secrets)에서 암호를 꺼내옵니다.
+ACCESS_PASSWORD = st.secrets["APP_PASSWORD"]
 
 # 세션 상태(Session State)를 활용해 로그인 유무를 기억합니다.
 if 'logged_in' not in st.session_state:
