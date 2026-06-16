@@ -12,7 +12,7 @@ EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸
 ADMIN_PASSWORD = "0322"
 
 # ==========================================
-# [새로운 기능] 공장 직원용 공용 접속 비밀번호 설정
+# [새로운 기능] 직원용 공용 접속 비밀번호 설정
 # ==========================================
 ACCESS_PASSWORD = "27000833"
 
@@ -24,7 +24,7 @@ if 'logged_in' not in st.session_state:
 if not st.session_state['logged_in']:
     st.title("🔒 색도 관리 시스템 - 접속 제한")
     st.markdown("---")
-    st.subheader("공장 작업자 전용 인증")
+    st.subheader("작업자 전용 인증")
     
     # 비밀번호 입력창 (글자가 숨겨지는 password 타입)
     input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 8자리 입력")
