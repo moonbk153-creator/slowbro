@@ -14,7 +14,7 @@ EQUIPMENT_LIST = ["버닝", "태환 12KG", "프로밧 25KG", "뷸러 60KG", "뷸
 ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 
 # ==========================================
-# [새로운 기능] 공장 직원용 공용 접속 비밀번호 설정
+# [새로운 기능] 직원용 공용 접속 비밀번호 설정
 # ==========================================
 # Streamlit 클라우드의 비밀 금고(Secrets)에서 암호를 꺼내옵니다.
 ACCESS_PASSWORD = st.secrets["APP_PASSWORD"]
@@ -27,9 +27,9 @@ if 'logged_in' not in st.session_state:
 if not st.session_state['logged_in']:
     st.title("🔒 색도 관리 시스템 - 접속 제한")
     st.markdown("---")
-    st.subheader("공장 작업자 전용 인증")
+    st.subheader("작업자 전용 인증")
     
-    input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 4자리 입력")
+    input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 8자리 입력")
     
     if st.button("🔓 시스템 접속하기"):
         if input_pw == ACCESS_PASSWORD:
