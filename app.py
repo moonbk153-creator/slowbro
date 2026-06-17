@@ -15,20 +15,17 @@ DB_FILE = 'color_management.db'
 EQUIPMENT_LIST = ["버닝", "태환 12KG", "프로밧 25KG", "뷸러 60KG", "뷸러 120KG"]
 
 # [보안] Streamlit Secrets에서 암호를 불러옵니다. 
-# ※ 주의: Streamlit Cloud 설정(Secrets)에서 비밀번호를 꼭 27000833 으로 변경해주세요!
 ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 ACCESS_PASSWORD = st.secrets["APP_PASSWORD"]
 
 # ==========================================
 # [보안] 직원용 공용 접속 비밀번호 설정 및 자동 접속
 # ==========================================
-# 세션 상태(Session State)를 활용해 로그인 유무를 기억합니다.
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
 
 # 로그인 전 화면 구성
 if not st.session_state['logged_in']:
-    # [새로운 기능] 인터넷 주소창 끝에 ?pw=비밀번호 가 있으면 비밀번호 창을 안 보고 즉시 통과합니다!
     if "pw" in st.query_params and st.query_params["pw"] == ACCESS_PASSWORD:
         st.session_state['logged_in'] = True
         st.rerun()
@@ -37,7 +34,6 @@ if not st.session_state['logged_in']:
     st.markdown("---")
     st.subheader("작업자 전용 인증")
     
-    # 안내 문구를 8자리에 맞게 수정했습니다.
     input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 8자리 입력")
     
     if st.button("🔓 시스템 접속하기"):
@@ -253,7 +249,6 @@ with col_title:
     st.title("🎨 일일 제품 색도 관리 시스템")
 with col_logout:
     if st.button("🔒 로그아웃"):
-        # URL 자동 로그인을 방지하기 위해 쿼리 파라미터를 강제로 지워버립니다.
         st.query_params.clear()
         st.session_state['logged_in'] = False
         st.rerun()
@@ -327,7 +322,9 @@ if st.sidebar.button("데이터 등록하기"):
 st.subheader("📊 누적 측정 기록 조회")
 
 today_str_kst = get_now_kst().strftime("%Y-%m-%d")
+history_df = load_from_db()
 
+# 하단 상세 필터 레이아웃
 col_filter1, col_filter2, col_filter3 = st.columns(3)
 with col_filter1:
     search_query = st.text_input("🔍 제품명 검색 (전체 조회는 빈칸)")
@@ -337,32 +334,79 @@ with col_filter3:
     if date_filter_mode == "특정 일자 지정":
         filter_date = st.date_input("조회할 생산일 선택", value=get_now_kst().date())
 
-history_df = load_from_db()
-
-if not history_df.empty:
+# 테이블 출력용 데이터 필터링 수행
+display_df = history_df.copy()
+if not display_df.empty:
     if search_query:
-        history_df = history_df[history_df['제품명'].str.contains(search_query, na=False)]
+        display_df = display_df[display_df['제품명'].str.contains(search_query, na=False)]
     
     if date_filter_mode == "오늘(Today)":
-        history_df = history_df[history_df['생산일'] == today_str_kst]
+        display_df = display_df[display_df['생산일'] == today_str_kst]
         export_file_name = f"색도측정기록_{today_str_kst}.xlsx"
     elif date_filter_mode == "특정 일자 지정":
         filter_date_str = filter_date.strftime("%Y-%m-%d")
-        history_df = history_df[history_df['생산일'] == filter_date_str]
+        display_df = display_df[display_df['생산일'] == filter_date_str]
         export_file_name = f"색도측정기록_{filter_date_str}.xlsx"
     else:
         export_file_name = "색도측정기록_전체기간누적.xlsx"
-        
-    if not history_df.empty:
-        st.dataframe(history_df, use_container_width=True, hide_index=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        excel_data = to_excel(history_df)
-        st.download_button(label="📥 현재 화면의 표를 엑셀 파일로 다운로드", data=excel_data, file_name=export_file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# [기능 수정] 전체기간 조회 & 검색어 없을 때는 총합계 카드를 숨김
+if not (date_filter_mode == "전체 기간" and not search_query):
+    total_batches = len(display_df)
+    passed_batches = len(display_df[display_df['판정'] == "합격 🟢"])
+    failed_batches = len(display_df[display_df['판정'] == "불합격 🔴"])
+    
+    # 조건에 맞춰 지표 제목 변경
+    if date_filter_mode == "오늘(Today)":
+        metric_title = "오늘 총 생산"
+    elif date_filter_mode == "특정 일자 지정":
+        metric_title = f"{filter_date_str} 총 생산"
     else:
-        st.info(f"🔍 현재 선택하신 조건({date_filter_mode})에 일치하는 기록이 없습니다.")
+        metric_title = f"'{search_query}' 총 생산"
+
+    m_col1, m_col2, m_col3 = st.columns(3)
+    with m_col1:
+        st.metric(label=f"📦 {metric_title} 배치 수", value=f"{total_batches} 건")
+    with m_col2:
+        st.metric(label="🟢 합격 배치 수", value=f"{passed_batches} 건")
+    with m_col3:
+        st.metric(
+            label="🔴 불합격 배치 수", 
+            value=f"{failed_batches} 건", 
+            delta=f"+{failed_batches} 건 경고" if failed_batches > 0 else None,
+            delta_color="inverse"
+        )
+    st.markdown("<br>", unsafe_allow_html=True)
+
+# 데이터프레임 스타일링 및 표출
+if not display_df.empty:
+    
+    # [기능 수정] 특이사항은 노란색, 제품명은 굵게 하이라이트 지정
+    styled_df = display_df.style.set_properties(
+        subset=['특이사항'], 
+        **{'background-color': '#FFF3CD', 'color': '#856404', 'font-weight': 'bold'}
+    ).set_properties(
+        subset=['제품명'], 
+        **{'font-weight': 'bold'}
+    )
+
+    st.dataframe(
+        styled_df, 
+        use_container_width=True, 
+        hide_index=True,
+        # [기능 수정] 글자가 가려지지 않게 특이사항/제품명의 최소 칸 너비를 큼직하게 강제 고정
+        column_config={
+            "특이사항": st.column_config.TextColumn("특이사항", width="large"),
+            "제품명": st.column_config.TextColumn("제품명", width="medium"),
+            "작업자": st.column_config.TextColumn("작업자", width="small")
+        }
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    excel_data = to_excel(display_df)
+    st.download_button(label="📥 현재 화면의 표를 엑셀 파일로 다운로드", data=excel_data, file_name=export_file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("👈 데이터베이스에 저장된 기록이 완전히 비어 있습니다.")
+    st.info(f"🔍 현재 선택하신 조건({date_filter_mode})에 일치하는 기록이 없습니다.")
 
 st.markdown("---")
 
