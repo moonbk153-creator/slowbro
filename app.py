@@ -307,6 +307,9 @@ st.sidebar.markdown("---")
 measured_value = st.sidebar.number_input("측정 색도 입력", value=float(target_value), step=0.1, format="%.1f")
 remarks_input = st.sidebar.text_input("특이사항 (선택사항)", placeholder="간단한 메모 입력")
 
+# [새로운 기능] 오늘 마지막 배치임을 표시하는 체크박스
+is_last_batch = st.sidebar.checkbox("🏁 오늘 마지막 생산 배치입니다")
+
 if st.sidebar.button("데이터 등록하기"):
     if worker_name.strip() == "":
         st.sidebar.warning("⚠️ 작업자 이름을 입력해 주세요!")
@@ -314,7 +317,10 @@ if st.sidebar.button("데이터 등록하기"):
         difference = round(measured_value - target_value, 1)
         status = "합격 🟢" if abs(difference) <= 2.0 else "불합격 🔴"
         
-        save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, difference, status, remarks_input)
+        # 마지막 배치 체크 시, 특이사항 맨 앞에 태그 자동 추가
+        final_remarks = f"[마지막 배치 🏁] {remarks_input}".strip() if is_last_batch else remarks_input
+        
+        save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, difference, status, final_remarks)
         
         st.cache_data.clear()
         st.success(f"정상적으로 기록되었습니다.")
@@ -393,18 +399,18 @@ if not display_df.empty:
     )
     
     # ==========================================
-    # [신규 기능] 진행 중인 제품 빠른 추가 (Fast Track)
+    # ⚡ 진행 중인 제품 빠른 추가 (Fast Track)
     # ==========================================
     if date_filter_mode == "오늘(Today)":
         st.markdown("---")
         st.markdown("### ⚡ 진행 중인 라인 빠른 추가")
-        st.info("오늘 이미 측정한 기록이 있는 제품은 특이사항 없다면 아래에서 **'측정 색도'**만 입력하면 즉시 추가 기록됩니다.")
+        st.info("오늘 이미 측정한 기록이 있는 제품은 아래에서 **'측정 색도'**만 입력하면 특이사항 없이 1초 만에 즉시 추가 기록됩니다.")
         
         # 오늘 생산된 고유 조합(제품명, 설비, 작업자) 추출
         recent_batches = display_df[['제품명', '생산설비', '작업자']].drop_duplicates().reset_index(drop=True)
         batch_options = [f"▶ {row['제품명']} (설비: {row['생산설비']} / 작업자: {row['작업자']})" for idx, row in recent_batches.iterrows()]
         
-        col_q1, col_q2, col_q3, col_q4 = st.columns([3, 1, 1, 1])
+        col_q1, col_q2, col_q3, col_q4 = st.columns([3, 1, 1.2, 1])
         
         with col_q1:
             selected_batch_str = st.selectbox("이어서 측정할 제품을 선택하세요", batch_options)
@@ -421,13 +427,18 @@ if not display_df.empty:
                 st.text_input("기준 색도", value=f"{float(quick_target):.1f}", disabled=True)
             with col_q3:
                 quick_measured = st.number_input("새 측정값", value=float(quick_target), step=0.1, format="%.1f", key="quick_val")
+                # [새로운 기능] 빠른 추가 창에도 '마지막 배치' 체크박스 배치
+                quick_is_last_batch = st.checkbox("🏁 마지막 배치", key="quick_last")
             with col_q4:
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("🚀 1초 등록", use_container_width=True, type="primary"):
                     diff = round(quick_measured - quick_target, 1)
                     status = "합격 🟢" if abs(diff) <= 2.0 else "불합격 🔴"
-                    # 특이사항은 빈칸("")으로 자동 전송
-                    save_to_db(today_str_kst, quick_equip, quick_worker, quick_prod, quick_target, quick_measured, diff, status, "")
+                    
+                    # 마지막 배치 체크 여부에 따라 특이사항 자동 생성
+                    final_quick_remarks = "[마지막 배치 🏁]" if quick_is_last_batch else ""
+                    
+                    save_to_db(today_str_kst, quick_equip, quick_worker, quick_prod, quick_target, quick_measured, diff, status, final_quick_remarks)
                     st.cache_data.clear()
                     st.success("빠른 등록이 완료되었습니다!")
                     st.rerun()
