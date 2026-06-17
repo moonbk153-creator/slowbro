@@ -404,7 +404,7 @@ if not display_df.empty:
     if date_filter_mode == "오늘(Today)":
         st.markdown("---")
         st.markdown("### ⚡ 진행 중인 라인 빠른 추가")
-        st.info("오늘 이미 측정한 기록이 있는 제품은 아래에서 **'측정 색도'**만 입력하면 특이사항 없이 1초 만에 즉시 추가 기록됩니다.")
+        st.info("오늘 이미 측정한 기록이 있는 제품은 특이사항 없다면 아래에서 **'측정 색도'**만 입력하여 즉시 추가 기록됩니다.")
         
         # 오늘 생산된 고유 조합(제품명, 설비, 작업자) 추출
         recent_batches = display_df[['제품명', '생산설비', '작업자']].drop_duplicates().reset_index(drop=True)
