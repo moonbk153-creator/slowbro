@@ -14,7 +14,7 @@ EXCEL_FILE = 'data sheet.xlsx'
 DB_FILE = 'color_management.db'
 EQUIPMENT_LIST = ["버닝", "태환 12KG", "프로밧 25KG", "뷸러 60KG", "뷸러 120KG"]
 
-# [보안] Streamlit Secrets에서 암호를 불러옵니다.
+# [보안] Streamlit Secrets에서 암호를 불러옵니다. (관리자: 0322 / 접속: 27000833)
 ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 ACCESS_PASSWORD = st.secrets["APP_PASSWORD"]
 
@@ -307,7 +307,6 @@ st.sidebar.markdown("---")
 measured_value = st.sidebar.number_input("측정 색도 입력", value=float(target_value), step=0.1, format="%.1f")
 remarks_input = st.sidebar.text_input("특이사항 (선택사항)", placeholder="간단한 메모 입력")
 
-# [새로운 기능] 오늘 마지막 배치임을 표시하는 체크박스
 is_last_batch = st.sidebar.checkbox("🏁 오늘 마지막 생산 배치입니다")
 
 if st.sidebar.button("데이터 등록하기"):
@@ -317,7 +316,6 @@ if st.sidebar.button("데이터 등록하기"):
         difference = round(measured_value - target_value, 1)
         status = "합격 🟢" if abs(difference) <= 2.0 else "불합격 🔴"
         
-        # 마지막 배치 체크 시, 특이사항 맨 앞에 태그 자동 추가
         final_remarks = f"[마지막 배치 🏁] {remarks_input}".strip() if is_last_batch else remarks_input
         
         save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, difference, status, final_remarks)
@@ -334,7 +332,6 @@ st.subheader("📊 누적 측정 기록 조회")
 today_str_kst = get_now_kst().strftime("%Y-%m-%d")
 history_df = load_from_db()
 
-# 하단 상세 필터 레이아웃
 col_filter1, col_filter2, col_filter3 = st.columns(3)
 with col_filter1:
     search_query = st.text_input("🔍 제품명 검색 (전체 조회는 빈칸)")
@@ -344,7 +341,6 @@ with col_filter3:
     if date_filter_mode == "특정 일자 지정":
         filter_date = st.date_input("조회할 생산일 선택", value=get_now_kst().date())
 
-# 테이블 출력용 데이터 필터링 수행
 display_df = history_df.copy()
 if not display_df.empty:
     if search_query:
@@ -360,7 +356,6 @@ if not display_df.empty:
     else:
         export_file_name = "색도측정기록_전체기간누적.xlsx"
 
-# 전체기간 조회 & 검색어 없을 때는 총합계 카드를 완전히 숨김
 if not (date_filter_mode == "전체 기간" and not search_query):
     total_batches = len(display_df)
     
@@ -374,7 +369,6 @@ if not (date_filter_mode == "전체 기간" and not search_query):
     st.metric(label=f"📦 {metric_title} 배치 수", value=f"{total_batches} 건")
     st.markdown("<br>", unsafe_allow_html=True)
 
-# 데이터프레임 스타일링 및 표출
 if not display_df.empty:
     styled_df = display_df.style.format(
         {"측정색도": "{:.1f}", "기준색도": "{:.1f}", "오차": "{:.1f}"}, 
@@ -398,15 +392,12 @@ if not display_df.empty:
         }
     )
     
-    # ==========================================
     # ⚡ 진행 중인 제품 빠른 추가 (Fast Track)
-    # ==========================================
     if date_filter_mode == "오늘(Today)":
         st.markdown("---")
         st.markdown("### ⚡ 진행 중인 라인 빠른 추가")
-        st.info("오늘 이미 측정한 기록이 있는 제품은 특이사항 없다면 아래에서 **'측정 색도'**만 입력하여 즉시 추가 기록됩니다.")
+        st.info("오늘 이미 생산한 기록이 있는 제품은 특이사항이 없다면 아래에서 **'측정 색도'**만 입력하여 즉시 추가 기록됩니다.")
         
-        # 오늘 생산된 고유 조합(제품명, 설비, 작업자) 추출
         recent_batches = display_df[['제품명', '생산설비', '작업자']].drop_duplicates().reset_index(drop=True)
         batch_options = [f"▶ {row['제품명']} (설비: {row['생산설비']} / 작업자: {row['작업자']})" for idx, row in recent_batches.iterrows()]
         
@@ -416,7 +407,6 @@ if not display_df.empty:
             selected_batch_str = st.selectbox("이어서 측정할 제품을 선택하세요", batch_options)
             
         if selected_batch_str:
-            # 선택한 제품의 정보 역추적
             selected_idx = batch_options.index(selected_batch_str)
             quick_prod = recent_batches.iloc[selected_idx]['제품명']
             quick_equip = recent_batches.iloc[selected_idx]['생산설비']
@@ -427,7 +417,6 @@ if not display_df.empty:
                 st.text_input("기준 색도", value=f"{float(quick_target):.1f}", disabled=True)
             with col_q3:
                 quick_measured = st.number_input("새 측정값", value=float(quick_target), step=0.1, format="%.1f", key="quick_val")
-                # [새로운 기능] 빠른 추가 창에도 '마지막 배치' 체크박스 배치
                 quick_is_last_batch = st.checkbox("🏁 마지막 배치", key="quick_last")
             with col_q4:
                 st.markdown("<br>", unsafe_allow_html=True)
@@ -435,7 +424,6 @@ if not display_df.empty:
                     diff = round(quick_measured - quick_target, 1)
                     status = "합격 🟢" if abs(diff) <= 2.0 else "불합격 🔴"
                     
-                    # 마지막 배치 체크 여부에 따라 특이사항 자동 생성
                     final_quick_remarks = "[마지막 배치 🏁]" if quick_is_last_batch else ""
                     
                     save_to_db(today_str_kst, quick_equip, quick_worker, quick_prod, quick_target, quick_measured, diff, status, final_quick_remarks)
@@ -452,13 +440,28 @@ else:
 st.markdown("---")
 
 # ==========================================
-# 5. 화면 구성: 관리자 도구
+# 5. 화면 구성: 관리자 도구 (DB 백업 다운로드 탑재)
 # ==========================================
 with st.expander("🛠️ 관리자 전용 메뉴 (데이터 수정/삭제 및 과거 엑셀 업로드)"):
     input_password = st.text_input("🔒 관리자 비밀번호를 입력하세요", type="password")
     
     if input_password == ADMIN_PASSWORD:
         st.success("✅ 관리자 인증 완료")
+        
+        # [신규 기능] 관리자 인증 성공 시, 순수 DB 파일을 파일 형태로 직접 백업 추출할 수 있는 버튼 제공
+        try:
+            with open(DB_FILE, "rb") as f:
+                db_bytes = f.read()
+            st.download_button(
+                label="💾 데이터베이스 원본 파일(.db) 백업 다운로드",
+                data=db_bytes,
+                file_name="color_management.db",
+                mime="application/octet-stream",
+                type="secondary"
+            )
+            st.markdown("<small>※ 다운로드된 .db 파일은 전용 뷰어 프로그램 등을 통해 내부 순수 데이터를 확인할 수 있으며, 추후 계정 이전 시 인수인계용 파일로 사용됩니다.</small><br><br>", unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"DB 파일 백업 준비 중 오류 발생: {e}")
         
         tab1, tab2, tab3 = st.tabs(["개별 데이터 수정/삭제", "📂 과거 측정 기록 업로드", "📅 과거 기준값 이력 업로드"])
         
