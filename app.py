@@ -341,11 +341,11 @@ if not display_df.empty:
         display_df = display_df[display_df['제품명'].str.contains(search_query, na=False)]
     
     if date_filter_mode == "오늘(Today)":
-        display_df = display_df[display_df['生産일'] == today_str_kst]
+        display_df = display_df[display_df['생산일'] == today_str_kst]
         export_file_name = f"색도측정기록_{today_str_kst}.xlsx"
     elif date_filter_mode == "특정 일자 지정":
         filter_date_str = filter_date.strftime("%Y-%m-%d")
-        display_df = display_df[display_df['生産일'] == filter_date_str]
+        display_df = display_df[display_df['생산일'] == filter_date_str]
         export_file_name = f"색도측정기록_{filter_date_str}.xlsx"
     else:
         export_file_name = "색도측정기록_전체기간누적.xlsx"
