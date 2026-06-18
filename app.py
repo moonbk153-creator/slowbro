@@ -14,7 +14,7 @@ EXCEL_FILE = 'data sheet.xlsx'
 DB_FILE = 'color_management.db'
 EQUIPMENT_LIST = ["버닝", "태환 12KG", "프로밧 25KG", "뷸러 60KG", "뷸러 120KG"]
 
-# [보안] Streamlit Secrets에서 암호를 불러옵니다. (관리자 암호: 0322 / 접속 암호: 27000833)
+# [보안] Streamlit Secrets에서 암호를 불러옵니다.
 ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 ACCESS_PASSWORD = st.secrets["APP_PASSWORD"]
 
