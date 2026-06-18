@@ -21,7 +21,7 @@ ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 ACCESS_PASSWORD = st.secrets["APP_PASSWORD"]
 
 # ==========================================
-# [보안] 공장 직원용 공용 접속 비밀번호 설정 및 자동 접속
+# [보안] 직원용 공용 접속 비밀번호 설정 및 자동 접속
 # ==========================================
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
@@ -33,7 +33,7 @@ if not st.session_state['logged_in']:
 
     st.title("🔒 색도 관리 시스템 - 접속 제한")
     st.markdown("---")
-    st.subheader("공장 작업자 전용 인증")
+    st.subheader("작업자 전용 인증")
     
     input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 8자리 입력")
     
