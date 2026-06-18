@@ -12,7 +12,7 @@ st.set_page_config(page_title="색도 관리 시스템", layout="wide")
 
 EXCEL_FILE = 'data sheet.xlsx'
 DB_FILE = 'color_management.db'
-EQUIPMENT_LIST = ["버닝", "태환 12KG", "프로밧 25KG", "뷸러 60KG", "뷸러 120KG"]
+EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
 
 # [보안] Streamlit Secrets에서 암호를 불러옵니다.
 ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
@@ -403,7 +403,7 @@ if not display_df.empty:
         display_df = display_df[display_df['제품명'].str.contains(search_query, na=False)]
     
     # [수정 기능] 오늘 및 특정 일자 조회 시 지시하신 설비 정렬 순서 정의 및 내부 생산순 정렬 수행
-    equipment_order = ["버닝", "태환 12KG", "프로밧 25KG", "뷸러 60KG", "뷸러 120KG"]
+    equipment_order = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
     
     if date_filter_mode == "오늘(Today)":
         display_df = display_df[display_df['생산일'] == today_str_kst]
@@ -441,13 +441,13 @@ def highlight_equipment(s):
     for val in s:
         if val == '버닝':
             colors.append('background-color: #E1F5FE; color: black; font-weight: bold;') # 연한 하늘색
-        elif val == '태환 12KG':
+        elif val == '태환 12kg':
             colors.append('background-color: #FFF3CD; color: black; font-weight: bold;') # 연노랑색
-        elif val == '프로밧 25KG':
+        elif val == '프로밧 25kg':
             colors.append('background-color: #FCE4EC; color: black; font-weight: bold;') # 연한 핑크색
-        elif val == '뷸러 60KG':
+        elif val == '뷸러 60kg':
             colors.append('background-color: #E8F5E9; color: black; font-weight: bold;') # 연녹색
-        elif val == '뷸러 120KG':
+        elif val == '뷸러 120kg':
             colors.append('background-color: #D4EFDF; color: black; font-weight: bold;') # 연한 녹색 변경 (글씨 검정 대비)
         else:
             colors.append('')
