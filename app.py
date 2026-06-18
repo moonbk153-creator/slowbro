@@ -33,7 +33,7 @@ if not st.session_state['logged_in']:
 
     st.title("🔒 색도 관리 시스템 - 접속 제한")
     st.markdown("---")
-    st.subheader("작업자 전용 인증") # [수정] 공장 작업자 -> 작업자 변경
+    st.subheader("작업자 전용 인증")
     
     input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 8자리 입력")
     
@@ -429,10 +429,15 @@ if not display_df.empty:
         export_file_name = "색도측정기록_전체기간누적.xlsx"
 
     # ---------------------------------------------------------
-    # [핵심 자동화 수정 완료] 일자별 진짜 마지막 순서 배치 딱 1개만 자동 플래그 부여
+    # [버그 수정 완료] 중복 표기 방지 및 일자별 진짜 최종 마크 1개 자동화 로직
     # ---------------------------------------------------------
     if not display_df.empty:
-        # 제품 구분 없이 순수하게 '생산일' 기준으로만 묶어 해당 날짜의 가장 높은 고유번호(최종 순서) 1개만 추출합니다.
+        # Step 1: 데이터베이스에 기존 수동 체크박스로 이미 누적 기입되었을지 모르는 문구를 1차적으로 강제 청소합니다.
+        display_df['특이사항'] = display_df['특이사항'].astype(str).apply(
+            lambda x: x.replace("[마지막 배치 🏁]", "").strip()
+        )
+        
+        # Step 2: 그 다음, 날짜별 그룹 내에서 실시간 가장 높은 고유번호를 가진 진짜 "단 1개의 행"에만 마크를 새로 붙여줍니다.
         idx_latest = display_df.groupby('생산일')['고유번호'].idxmax()
         for idx in idx_latest:
             current_remark = display_df.loc[idx, '특이사항']
