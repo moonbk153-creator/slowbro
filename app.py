@@ -33,7 +33,7 @@ if not st.session_state['logged_in']:
 
     st.title("🔒 색도 관리 시스템 - 접속 제한")
     st.markdown("---")
-    st.subheader("작업자 전용 인증")
+    st.subheader("작업자 전용 인증") # [수정] 공장 작업자 -> 작업자 변경
     
     input_pw = st.text_input("사내 공용 비밀번호를 입력하세요", type="password", placeholder="비밀번호 8자리 입력")
     
@@ -429,11 +429,11 @@ if not display_df.empty:
         export_file_name = "색도측정기록_전체기간누적.xlsx"
 
     # ---------------------------------------------------------
-    # [핵심 자동화 기능 완벽 수정] 데일리별(생산일 + 제품명 기준) 자동 플래그 부여
+    # [핵심 자동화 수정 완료] 일자별 진짜 마지막 순서 배치 딱 1개만 자동 플래그 부여
     # ---------------------------------------------------------
     if not display_df.empty:
-        # 무작정 한 개만 표시되는 문제를 해결하기 위해 그룹 기준에 ['생산일', '제품명']을 적용
-        idx_latest = display_df.groupby(['생산일', '제품명'])['고유번호'].idxmax()
+        # 제품 구분 없이 순수하게 '생산일' 기준으로만 묶어 해당 날짜의 가장 높은 고유번호(최종 순서) 1개만 추출합니다.
+        idx_latest = display_df.groupby('생산일')['고유번호'].idxmax()
         for idx in idx_latest:
             current_remark = display_df.loc[idx, '특이사항']
             if current_remark:
