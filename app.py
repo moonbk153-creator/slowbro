@@ -192,6 +192,26 @@ def save_to_db(prod_date, equipment, worker, product, target, measured, diff, st
     conn.commit()
     conn.close()
 
+# ---------------------------------------------------------
+# [수정 핵심 로직] 과거 누락된 고정 설비의 투입량을 실시간 매핑 보완해주는 변환 함수
+# ---------------------------------------------------------
+def auto_fill_input_amount(row):
+    equip = str(row['생산설비']).lower().replace(" ", "")
+    current_amt = str(row['투입량']).strip()
+    
+    # 버닝 설비는 이미 저장되어 있는 유동 투입량 데이터(1.35, 2.5, 3.75)를 유지
+    if '버닝' in equip:
+        return current_amt if current_amt != "" else "-"
+    
+    # 버닝이 아닌 설비 중 투입량이 누락되었거나 '-'인 과거 데이터는 설비명 기준으로 자동 매핑
+    if current_amt in ["", "-", "nan", "None"]:
+        if "태환" in equip: return "12kg"
+        elif "프로밧" in equip: return "25kg"
+        elif "60" in equip: return "60kg"
+        elif "120" in equip: return "120kg"
+    
+    return current_amt
+
 def load_from_db():
     conn = sqlite3.connect(DB_FILE)
     query = """
@@ -221,7 +241,10 @@ def load_from_db():
     conn.close()
 
     if df.empty:
-        return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '투입량', '측정색도', '오차', '기준색도', '작업자', '판정', '특이사항', '입력일시', '고유번호'])
+        return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '특이사항', '입력일시', '고유번호'])
+
+    # [보완 반영] 화면에 출력 및 엑셀 변환하기 직전 과거 데이터 실시간 보정 수행
+    df['투입량'] = df.apply(auto_fill_input_amount, axis=1)
 
     df['측정색도'] = pd.to_numeric(df['측정색도'], errors='coerce')
     df['기준색도'] = pd.to_numeric(df['기준색도'], errors='coerce')
@@ -320,9 +343,6 @@ prod_date_str = production_date_input.strftime("%Y-%m-%d")
 
 selected_equipment = st.sidebar.selectbox("생산 설비 선택", EQUIPMENT_LIST)
 
-# ---------------------------------------------------------
-# 설비 선택 조건에 따른 원료 투입량 자동 세팅 및 분기 제어
-# ---------------------------------------------------------
 equip_clean = str(selected_equipment).lower().replace(" ", "")
 if "버닝" in equip_clean:
     input_amount_val = st.sidebar.selectbox("원료(생두) 투입량 선택", ["1.35kg", "2.5kg", "3.75kg"])
@@ -333,7 +353,6 @@ else:
     elif "120" in equip_clean: input_amount_val = "120kg"
     else: input_amount_val = "-"
     st.sidebar.text_input("원료(생두) 투입량 (고정)", value=input_amount_val, disabled=True)
-# ---------------------------------------------------------
 
 worker_name = st.sidebar.text_input("작업자 이름", placeholder="예) 문병국")
 
@@ -433,7 +452,7 @@ if not display_df.empty:
         display_df = display_df[display_df['제품명'].str.contains(search_query, na=False)]
     
     if date_filter_mode == "오늘(Today)":
-        display_df = display_df[display_df['생산일'] == today_str_kst]
+        display_df = display_df[display_df['生産일'] == today_str_kst] if '生産일' in display_df.columns else display_df[display_df['생산일'] == today_str_kst]
         display_df['정렬순서'] = display_df['생산설비'].apply(get_equip_sort_order)
         display_df = display_df.sort_values(by=['정렬순서', '고유번호'], ascending=[True, True])
         display_df = display_df.drop(columns=['정렬순서'])
@@ -504,7 +523,6 @@ if not display_df.empty:
         subset=['특이사항'], 
         **{'background-color': '#E8DAEF', 'color': 'black', 'font-weight': 'bold'}
     ).set_properties(
-        # [에러 수정 완료] 오타 없는 정확한 컬럼명 사용
         subset=['제품명'], 
         **{'font-weight': 'bold'}
     )
