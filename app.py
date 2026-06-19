@@ -192,18 +192,13 @@ def save_to_db(prod_date, equipment, worker, product, target, measured, diff, st
     conn.commit()
     conn.close()
 
-# ---------------------------------------------------------
-# [수정 핵심 로직] 과거 누락된 고정 설비의 투입량을 실시간 매핑 보완해주는 변환 함수
-# ---------------------------------------------------------
 def auto_fill_input_amount(row):
     equip = str(row['생산설비']).lower().replace(" ", "")
     current_amt = str(row['투입량']).strip()
     
-    # 버닝 설비는 이미 저장되어 있는 유동 투입량 데이터(1.35, 2.5, 3.75)를 유지
     if '버닝' in equip:
         return current_amt if current_amt != "" else "-"
     
-    # 버닝이 아닌 설비 중 투입량이 누락되었거나 '-'인 과거 데이터는 설비명 기준으로 자동 매핑
     if current_amt in ["", "-", "nan", "None"]:
         if "태환" in equip: return "12kg"
         elif "프로밧" in equip: return "25kg"
@@ -243,7 +238,6 @@ def load_from_db():
     if df.empty:
         return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '특이사항', '입력일시', '고유번호'])
 
-    # [보완 반영] 화면에 출력 및 엑셀 변환하기 직전 과거 데이터 실시간 보정 수행
     df['투입량'] = df.apply(auto_fill_input_amount, axis=1)
 
     df['측정색도'] = pd.to_numeric(df['측정색도'], errors='coerce')
@@ -289,6 +283,38 @@ def get_last_record(product_name):
     row = cursor.fetchone()
     conn.close()
     return row
+
+# ---------------------------------------------------------
+# [신규 기능] 제품의 생산설비별 최신 기록 및 생산 빈도수 역추적 함수
+# ---------------------------------------------------------
+def get_equipment_last_records(product_name):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    query = """
+        WITH RankedRecords AS (
+            SELECT 
+                equipment, production_date, measured_value, status, id,
+                ROW_NUMBER() OVER (PARTITION BY equipment ORDER BY production_date DESC, timestamp DESC, id DESC) as rn
+            FROM color_records
+            WHERE product_name = ?
+        ),
+        EquipCounts AS (
+            SELECT equipment, COUNT(*) as cnt
+            FROM color_records
+            WHERE product_name = ?
+            GROUP BY equipment
+        )
+        SELECT r.equipment, r.production_date, r.measured_value, r.status, c.cnt
+        FROM RankedRecords r
+        JOIN EquipCounts c ON r.equipment = c.equipment
+        WHERE r.rn = 1
+        ORDER BY c.cnt DESC, r.production_date DESC
+    """
+    cursor.execute(query, (product_name, product_name))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+# ---------------------------------------------------------
 
 @st.cache_data
 def to_excel(df):
@@ -381,27 +407,40 @@ else:
         target_history_df.columns = ['적용 시작일', '기준색도']
         st.dataframe(target_history_df.style.format({"기준색도": "{:.1f}"}), hide_index=True, use_container_width=True)
 
-last_record = get_last_record(selected_product)
-if last_record:
-    last_date_str, last_measured, last_status = last_record
-    
-    try:
-        last_date_obj = datetime.strptime(last_date_str, "%Y-%m-%d").date()
-        is_old = (get_now_kst().date() - last_date_obj).days > 120
-    except:
-        is_old = False
+# ---------------------------------------------------------
+# [신규 수정 기능] 이전 최종 생산 정보의 설비별 자동 조건부 표출 분기 처리
+# ---------------------------------------------------------
+last_records = get_equipment_last_records(selected_product)
+if last_records:
+    # 조건 A: 만약 시스템 내 모든 생산설비(5개 전 라인)에서 생산 이력이 잡힌 과도한 다생산 제품인 경우
+    if len(last_records) == len(EQUIPMENT_LIST):
+        display_records = last_records[:2] # 가장 많이 생산된 설비 내역 "상위 2개만" 슬라이싱 표출
+        st.sidebar.caption("💡 모든 설비 이력이 존재하여 주 생산 라인 2개만 노출합니다.")
+    else:
+        # 조건 B: 생산된 설비가 1개이거나 일부 복수 라인(예: 뷸러 120kg + 60kg)인 경우 해당 조건에 맞는 것만 전부 출력
+        display_records = last_records
         
-    try:
-        last_measured_fmt = f"{float(last_measured):.1f}"
-    except:
-        last_measured_fmt = str(last_measured)
+    for row in display_records:
+        equip_name, last_date_str, last_measured, last_status, _ = row
+        try:
+            last_date_obj = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+            is_old = (get_now_kst().date() - last_date_obj).days > 120
+        except:
+            is_old = False
+            
+        try:
+            last_measured_fmt = f"{float(last_measured):.1f}"
+        except:
+            last_measured_fmt = str(last_measured)
 
-    display_date = f":red[**{last_date_str} (4개월 초과!)**]" if is_old else last_date_str
-    display_measured = f":red[**{last_measured_fmt} (이전 불합격!)**]" if "불합격" in last_status else str(last_measured_fmt)
-    
-    st.sidebar.info(f"🕒 **이전 최종 생산일:** {display_date}\n\n📉 **이전 측정 색도:** {display_measured}")
+        display_date = f":red[**{last_date_str} (4개월 초과!)**]" if is_old else last_date_str
+        display_measured = f":red[**{last_measured_fmt} (이전 불합격!)**]" if "불합격" in last_status else str(last_measured_fmt)
+        
+        # 각 생산 설비별로 독립된 정보 카드 박스를 실시간 랜더링
+        st.sidebar.info(f"⚙️ **{equip_name} 생산 이력**\n\n🕒 **이전 최종 생산일:** {display_date}\n\n📉 **이전 측정 색도:** {display_measured}")
 else:
     st.sidebar.warning("이전 생산 기록이 없습니다 (최초 입력).")
+# ---------------------------------------------------------
 
 st.sidebar.markdown("---")
 
@@ -452,7 +491,7 @@ if not display_df.empty:
         display_df = display_df[display_df['제품명'].str.contains(search_query, na=False)]
     
     if date_filter_mode == "오늘(Today)":
-        display_df = display_df[display_df['生産일'] == today_str_kst] if '生産일' in display_df.columns else display_df[display_df['생산일'] == today_str_kst]
+        display_df = display_df[display_df['생산일'] == today_str_kst]
         display_df['정렬순서'] = display_df['생산설비'].apply(get_equip_sort_order)
         display_df = display_df.sort_values(by=['정렬순서', '고유번호'], ascending=[True, True])
         display_df = display_df.drop(columns=['정렬순서'])
