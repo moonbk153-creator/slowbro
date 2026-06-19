@@ -454,7 +454,6 @@ if st.sidebar.button("데이터 등록하기"):
 # ==========================================
 st.subheader("📊 누적 측정 기록 조회")
 
-# 전체 DB 원본 데이터를 우선 로드 (역사상 첫 생산 분석용)
 history_df = load_from_db()
 
 col_filter1, col_filter2, col_filter3 = st.columns(3)
@@ -499,35 +498,47 @@ if not display_df.empty:
         export_file_name = "색도측정기록_전체기간누적.xlsx"
 
     # ---------------------------------------------------------
-    # [수정 핵심 로직] 역사상 '설비 첫 배치' & '당일 마지막 배치' 자동 식별
+    # [수정 핵심 로직] 자동 태그 부착 (기준값 변경 첫생산, 설비 첫생산, 당일 마지막 배치)
     # ---------------------------------------------------------
     if not display_df.empty:
-        # 기존에 등록된 문구 제거 (중복 방지)
+        # 기존 모든 자동 태그 제거 (중복 방지용 클렌징)
         display_df['특이사항'] = display_df['특이사항'].astype(str).apply(
-            lambda x: x.replace("[마지막 배치 🏁]", "").replace("[설비 첫 배치 🚀]", "").strip()
+            lambda x: x.replace("[마지막 배치 🏁]", "").replace("[해당 설비 첫 배치 🚀]", "").replace("[기준값 변경 후 첫 생산 🔔]", "").strip()
         )
         
-        # 1. [설비 첫 배치 🚀] - 화면에 보이는 당일만 보는 것이 아니라, 
-        # 전체 데이터(history_df)를 기준으로 해당 제품+해당 설비 조합의 가장 작은 고유번호(최초 기록)를 찾습니다.
-        all_time_first_ids = history_df.groupby(['제품명', '생산설비'])['고유번호'].min().values
+        # 1. [기준값 변경 후 첫 생산 🔔] 마킹
+        conn = sqlite3.connect(DB_FILE)
+        th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn)
+        conn.close()
         
-        # 화면에 표시될 표(display_df) 안에 그 '역사적 첫 기록 고유번호'가 포함되어 있다면 마크를 달아줍니다.
+        target_change_first_ids = set()
+        for _, row in th_df.iterrows():
+            p_name = row['product_name']
+            e_date = row['effective_date']
+            # 전체 역사(history_df)에서 해당 기준일자 이후 생산된 기록 중 가장 오래된(역순 정렬이므로 마지막행) 것 추출
+            subset = history_df[(history_df['제품명'] == p_name) & (history_df['생산일'] >= e_date)]
+            if not subset.empty:
+                first_id = subset.iloc[-1]['고유번호']
+                target_change_first_ids.add(first_id)
+                
+        tc_mask = display_df['고유번호'].isin(target_change_first_ids)
+        for idx in display_df[tc_mask].index:
+            current_remark = display_df.loc[idx, '특이사항']
+            display_df.loc[idx, '특이사항'] = f"[기준값 변경 후 첫 생산 🔔] {current_remark}".strip()
+
+        # 2. [설비 첫 배치 🚀] 마킹 - 해당 제품이 특정 설비에서 전체 역사상 최초로 볶아진 건 추출
+        # history_df는 최신순이므로 그룹별 마지막 행(last)이 역사적 첫 기록임
+        all_time_first_ids = history_df.groupby(['제품명', '생산설비'])['고유번호'].last().values
         first_mask = display_df['고유번호'].isin(all_time_first_ids)
         for idx in display_df[first_mask].index:
             current_remark = display_df.loc[idx, '특이사항']
-            if current_remark:
-                display_df.loc[idx, '특이사항'] = f"[해당설비 첫 배치 🚀] {current_remark}"
-            else:
-                display_df.loc[idx, '특이사항'] = "[해당설비 첫 배치 🚀]"
+            display_df.loc[idx, '특이사항'] = f"[해당 설비 첫 배치 🚀] {current_remark}".strip()
                 
-        # 2. [마지막 배치 🏁] - 각 날짜별로 생산된 배수 중 가장 늦은(큰) 고유번호(마지막 기록) 1개만 추출
+        # 3. [마지막 배치 🏁] 마킹 - 조회된 일자별 가장 마지막 순서의 배치 추출
         idx_latest = display_df.groupby('생산일')['고유번호'].idxmax()
         for idx in idx_latest:
             current_remark = display_df.loc[idx, '특이사항']
-            if current_remark:
-                display_df.loc[idx, '특이사항'] = f"[마지막 배치 🏁] {current_remark}"
-            else:
-                display_df.loc[idx, '특이사항'] = "[마지막 배치 🏁]"
+            display_df.loc[idx, '특이사항'] = f"[마지막 배치 🏁] {current_remark}".strip()
     # ---------------------------------------------------------
 
 if not (date_filter_mode == "전체 기간" and not search_query):
