@@ -231,13 +231,9 @@ def save_to_db(prod_date, equipment, worker, product, target, measured, diff, st
     conn.commit()
     conn.close()
 
-# ---------------------------------------------------------
-# [신규 추가] 중복 입력(더블클릭 방지) 판별 함수 (30초 제한)
-# ---------------------------------------------------------
 def check_recent_duplicate(prod_date, equipment, product, measured_val):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # 해당 설비, 해당 제품의 가장 마지막 데이터를 불러옵니다.
     cursor.execute('''
         SELECT measured_value, timestamp 
         FROM color_records 
@@ -249,20 +245,16 @@ def check_recent_duplicate(prod_date, equipment, product, measured_val):
     
     if row:
         last_val, last_time_str = row
-        # 측정값이 완전히 동일한지 확인
         if float(last_val) == float(measured_val):
             try:
-                # 입력된 시간을 계산하여 30초 이내인지 확인
                 last_time = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
                 current_time_str = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
                 current_time = datetime.strptime(current_time_str, "%Y-%m-%d %H:%M:%S")
-                
                 if (current_time - last_time).total_seconds() < 30: 
-                    return True # 30초 이내 동일값 중복 발견!
+                    return True 
             except:
                 pass
     return False
-# ---------------------------------------------------------
 
 def auto_fill_input_amount(row):
     equip = str(row['생산설비']).lower().replace(" ", "")
@@ -521,7 +513,6 @@ if st.sidebar.button("데이터 등록하기"):
     if worker_name == "" or worker_name is None:
         st.sidebar.warning("⚠️ 작업자 이름을 지정해 주세요!")
     else:
-        # [신규 추가] 중복 입력 필터링
         if check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value):
             st.sidebar.error("⚠️ 방금 동일한 측정값이 등록되었습니다. 중복 방지를 위해 30초 대기 후 다시 시도해주세요.")
         else:
@@ -616,6 +607,9 @@ if not display_df.empty:
             current_remark = display_df.loc[idx, '특이사항']
             display_df.loc[idx, '특이사항'] = f"[마지막 배치 🏁] {current_remark}".strip()
 
+# ---------------------------------------------------------
+# [기능 보완] 총 배치수 출력 컴포넌트 오른편에 설비별 배치수 가로 동적 배열
+# ---------------------------------------------------------
 if not (date_filter_mode == "전체 기간" and not search_query):
     total_batches = len(display_df)
     
@@ -626,8 +620,22 @@ if not (date_filter_mode == "전체 기간" and not search_query):
     else:
         metric_title = f"'{search_query}' 총 생산"
 
-    st.metric(label=f"📦 {metric_title} 배치 수", value=f"{total_batches} 건")
+    # 현재 노출된 테이블 데이터로부터 설비별 배치 빈도수(value_counts) 추출
+    equip_counts = display_df['생산설비'].value_counts()
+    # 고정된 순서 가독성을 위해 정렬 규칙에 매칭되는 가동 설비 목록만 슬라이싱
+    present_equips = [eq for eq in EQUIPMENT_LIST if eq in equip_counts.index]
+    
+    # st.columns를 생성하여 첫 칸에는 합계, 이후 칸에는 개별 가동 설비 메트릭 표출
+    metric_cols = st.columns(1 + len(present_equips))
+    with metric_cols[0]:
+        st.metric(label=f"📦 {metric_title} 배치 수", value=f"{total_batches} 건")
+        
+    for idx, eq in enumerate(present_equips):
+        with metric_cols[idx + 1]:
+            st.metric(label=f"⚙️ {eq}", value=f"{equip_counts[eq]} 건")
+            
     st.markdown("<br>", unsafe_allow_html=True)
+# ---------------------------------------------------------
 
 def highlight_equipment(s):
     colors = []
@@ -701,8 +709,6 @@ if not display_df.empty:
             with col_q4:
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("🚀 1초 등록", use_container_width=True, type="primary"):
-                    
-                    # [신규 추가] 빠른 추가 패스트트랙에서도 중복 방지 로직 적용
                     if check_recent_duplicate(today_str_kst, quick_equip, quick_prod, quick_measured):
                         st.error("⚠️ 방금 동일한 측정값이 등록되었습니다. (중복 방지 30초 대기)")
                     else:
