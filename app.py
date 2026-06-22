@@ -231,6 +231,39 @@ def save_to_db(prod_date, equipment, worker, product, target, measured, diff, st
     conn.commit()
     conn.close()
 
+# ---------------------------------------------------------
+# [신규 추가] 중복 입력(더블클릭 방지) 판별 함수 (30초 제한)
+# ---------------------------------------------------------
+def check_recent_duplicate(prod_date, equipment, product, measured_val):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # 해당 설비, 해당 제품의 가장 마지막 데이터를 불러옵니다.
+    cursor.execute('''
+        SELECT measured_value, timestamp 
+        FROM color_records 
+        WHERE production_date=? AND equipment=? AND product_name=?
+        ORDER BY id DESC LIMIT 1
+    ''', (prod_date, equipment, product))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        last_val, last_time_str = row
+        # 측정값이 완전히 동일한지 확인
+        if float(last_val) == float(measured_val):
+            try:
+                # 입력된 시간을 계산하여 30초 이내인지 확인
+                last_time = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
+                current_time_str = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
+                current_time = datetime.strptime(current_time_str, "%Y-%m-%d %H:%M:%S")
+                
+                if (current_time - last_time).total_seconds() < 30: 
+                    return True # 30초 이내 동일값 중복 발견!
+            except:
+                pass
+    return False
+# ---------------------------------------------------------
+
 def auto_fill_input_amount(row):
     equip = str(row['생산설비']).lower().replace(" ", "")
     current_amt = str(row['투입량']).strip()
@@ -279,7 +312,6 @@ def load_from_db():
 
     df['투입량'] = df.apply(auto_fill_input_amount, axis=1)
 
-    # [핵심 보완] DB에서 데이터를 불러오는 즉시 작업자 이름의 띄어쓰기를 없애고, nan을 일괄 치환합니다.
     df['작업자'] = df['작업자'].astype(str).str.strip()
     df['작업자'] = df['작업자'].replace(['nan', 'None', '', 'NaN'], '미입력(과거기록)')
 
@@ -489,14 +521,18 @@ if st.sidebar.button("데이터 등록하기"):
     if worker_name == "" or worker_name is None:
         st.sidebar.warning("⚠️ 작업자 이름을 지정해 주세요!")
     else:
-        difference = round(measured_value - target_value, 1)
-        status = "합격 🟢" if abs(difference) <= 2.0 else "불합격 🔴"
-        
-        save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, difference, status, remarks_input, input_amount_val)
-        
-        st.cache_data.clear()
-        st.success(f"정상적으로 기록되었습니다.")
-        st.rerun()
+        # [신규 추가] 중복 입력 필터링
+        if check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value):
+            st.sidebar.error("⚠️ 방금 동일한 측정값이 등록되었습니다. 중복 방지를 위해 30초 대기 후 다시 시도해주세요.")
+        else:
+            difference = round(measured_value - target_value, 1)
+            status = "합격 🟢" if abs(difference) <= 2.0 else "불합격 🔴"
+            
+            save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, difference, status, remarks_input, input_amount_val)
+            
+            st.cache_data.clear()
+            st.success(f"정상적으로 기록되었습니다.")
+            st.rerun()
 
 # ==========================================
 # 4. 화면 구성: 메인 화면 (조회 및 필터)
@@ -665,13 +701,18 @@ if not display_df.empty:
             with col_q4:
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("🚀 1초 등록", use_container_width=True, type="primary"):
-                    diff = round(quick_measured - quick_target, 1)
-                    status = "합격 🟢" if abs(diff) <= 2.0 else "불합격 🔴"
                     
-                    save_to_db(today_str_kst, quick_equip, quick_worker, quick_prod, quick_target, quick_measured, diff, status, "", quick_amt)
-                    st.cache_data.clear()
-                    st.success("빠른 등록이 완료되었습니다!")
-                    st.rerun()
+                    # [신규 추가] 빠른 추가 패스트트랙에서도 중복 방지 로직 적용
+                    if check_recent_duplicate(today_str_kst, quick_equip, quick_prod, quick_measured):
+                        st.error("⚠️ 방금 동일한 측정값이 등록되었습니다. (중복 방지 30초 대기)")
+                    else:
+                        diff = round(quick_measured - quick_target, 1)
+                        status = "합격 🟢" if abs(diff) <= 2.0 else "불합격 🔴"
+                        
+                        save_to_db(today_str_kst, quick_equip, quick_worker, quick_prod, quick_target, quick_measured, diff, status, "", quick_amt)
+                        st.cache_data.clear()
+                        st.success("빠른 등록이 완료되었습니다!")
+                        st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
     excel_data = to_excel(display_df)
@@ -795,7 +836,6 @@ with st.expander("🛠️ 관리자 전용 메뉴 (데이터 수정/삭제 및 �
                     st.success(f"🎉 총 {updated_rows}건의 과거 데이터가 성공적으로 소문자 'kg'로 변환되었습니다!")
                     st.rerun()
             with col_m2:
-                # [신규 추가] 과거 DB에 박혀있는 작업자 이름 띄어쓰기를 영구 삭제하는 버튼
                 if st.button("🧹 작업자 이름 공백(띄어쓰기) DB 영구 제거"):
                     conn = sqlite3.connect(DB_FILE)
                     cursor = conn.cursor()
