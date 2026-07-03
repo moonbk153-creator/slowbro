@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import io 
 import pytz
 
-# [신규 추가] 자동 새로고침 라이브러리 로드 (설치 안 되었을 경우를 대비한 안전장치)
+# [신규 복구] 자동 새로고침 라이브러리 로드
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
@@ -549,13 +549,13 @@ if st.sidebar.button("데이터 등록하기"):
 # ==========================================
 st.subheader("📊 누적 측정 기록 조회")
 
-# [신규 기능] 실시간 자동 새로고침 스위치
+# [신규 복구] 실시간 자동 새로고침 스위치 UI (라이브러리 설치된 경우에만 작동)
 if st_autorefresh is not None:
     auto_refresh = st.checkbox("🔄 실시간 모니터링 켜기 (10초마다 화면 자동 새로고침)")
     if auto_refresh:
         st_autorefresh(interval=10000, limit=None, key="main_auto_refresh")
 else:
-    st.caption("💡 자동 새로고침을 원하시면 관리자에게 라이브러리(`streamlit-autorefresh`) 설치를 요청하세요.")
+    st.caption("💡 실시간 모니터링을 원하시면 관리자에게 `streamlit-autorefresh` 라이브러리 설치를 요청하세요.")
 
 history_df = load_from_db()
 
@@ -676,6 +676,7 @@ def highlight_equipment(s):
     return colors
 
 if not display_df.empty:
+    # 메인 화면에서는 확인여부 열을 숨김 처리
     main_display_df = display_df.drop(columns=['확인여부'], errors='ignore')
     
     styled_df = main_display_df.style.format(
