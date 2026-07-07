@@ -16,10 +16,6 @@ KST = pytz.timezone('Asia/Seoul')
 
 st.set_page_config(page_title="색도 관리 시스템", layout="wide")
 
-if 'show_toast' in st.session_state:
-    st.toast(st.session_state['show_toast'], icon="✅")
-    del st.session_state['show_toast']
-
 EXCEL_FILE = 'data sheet.xlsx'
 DB_FILE = 'color_management.db'
 
@@ -482,48 +478,114 @@ today_str_kst = get_now_kst().strftime("%Y-%m-%d")
 ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 
 # ==========================================
-# 3. 화면 구성: 메인 화면 입력 동선 통합 (UI 개선 4)
+# 3. 화면 구성: 왼쪽 사이드바 (데이터 입력)
 # ==========================================
-st.title("🎨 일일 제품 색도 관리 시스템")
+col_title, col_logout = st.columns([9, 1])
+with col_title:
+    st.title("🎨 일일 제품 색도 관리 시스템")
+with col_logout:
+    if st.button("🔒 로그아웃"):
+        st.query_params.clear()
+        st.session_state['logged_in'] = False
+        st.rerun()
+st.markdown("---")
 
-tab_n, tab_q = st.tabs(["📋 일반 데이터 등록", "⚡ 진행 중인 라인 빠른 추가"])
+st.sidebar.header("📝 새로운 데이터 입력")
 
-with tab_n:
-    with st.container(border=True):
-        cs1, cs2, cs3, cs4 = st.columns(4)
-        with cs1: p_date = st.date_input("생산일 선택").strftime("%Y-%m-%d")
-        with cs2: eq = st.selectbox("생산 설비", EQUIPMENT_LIST)
-        with cs3: wk = st.selectbox("작업자", CURRENT_WORKERS)
-        with cs4:
-            # 설비별 투입량 자동 계산 로직
-            amt = "12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "120kg" if "120" in eq else "-"
-            st.text_input("투입량", value=amt, disabled=True)
+production_date_input = st.sidebar.date_input("생산일 선택", value=get_now_kst().date())
+prod_date_str = production_date_input.strftime("%Y-%m-%d")
+
+selected_equipment = st.sidebar.selectbox("생산 설비 선택", EQUIPMENT_LIST)
+
+equip_clean = str(selected_equipment).lower().replace(" ", "")
+if "버닝" in equip_clean:
+    input_amount_val = st.sidebar.selectbox("원료(생두) 투입량 선택", ["1.35kg", "2.5kg", "3.75kg"])
+else:
+    if "태환" in equip_clean: input_amount_val = "12kg"
+    elif "프로밧" in equip_clean: input_amount_val = "25kg"
+    elif "60" in equip_clean: input_amount_val = "60kg"
+    elif "120" in equip_clean: input_amount_val = "120kg"
+    else: input_amount_val = "-"
+    st.sidebar.text_input("원료(생두) 투입량 (고정)", value=input_amount_val, disabled=True)
+
+if not CURRENT_WORKERS:
+    st.sidebar.error("등록된 작업자가 없습니다. 관리자 메뉴에서 추가해주세요.")
+    worker_name = ""
+else:
+    worker_name = st.sidebar.selectbox("작업자 선택", CURRENT_WORKERS)
+
+st.sidebar.markdown("---")
+selected_product = st.sidebar.selectbox("🔍 제품명 검색 및 선택 (클릭 후 타이핑)", list(TARGET_DATA.keys()))
+
+if ACTIVE_NOTICES.get(selected_product):
+    st.sidebar.warning(f"📢 **[작업자 전달사항]**\n\n{ACTIVE_NOTICES[selected_product]}", icon="🚨")
+    st.toast(f"**{selected_product}** 전달사항이 있습니다! 사이드바를 확인하세요.", icon="🚨")
+else:
+    st.sidebar.info("📢 **공지사항 없음**")
+
+target_value = get_historical_target(selected_product, prod_date_str)
+st.sidebar.info(f"📌 해당 생산일({prod_date_str})의 기준 색도: **{float(target_value):.1f}**")
+
+target_history_df = get_target_history_df(selected_product)
+real_changes = target_history_df[~target_history_df['effective_date'].isin(['2000-01-01', '2024-04-11', ''])]
+
+if real_changes.empty:
+    with st.sidebar.expander("📖 기준값 변경 이력 (변경 없음)"):
+        st.caption("✨ 이 제품은 최초 등록 이후 기준 색도가 변경된 적이 없습니다.")
+else:
+    with st.sidebar.expander("📖 이 제품의 기준값 변경 이력 (이력 존재)"):
+        target_history_df['effective_date'] = target_history_df['effective_date'].replace('2000-01-01', '최초 등록')
+        target_history_df['effective_date'] = target_history_df['effective_date'].replace('2024-04-11', '최초 등록')
+        target_history_df.columns = ['적용 시작일', '기준색도']
+        st.dataframe(target_history_df.style.format({"기준색도": "{:.1f}"}), hide_index=True, use_container_width=True)
+
+last_records = get_equipment_last_records(selected_product)
+if last_records:
+    if len(last_records) == len(EQUIPMENT_LIST):
+        display_records = last_records[:2]
+        st.sidebar.caption("💡 모든 설비 이력이 존재하여 주 생산 라인 2개만 노출합니다.")
+    else:
+        display_records = last_records
         
-        st.markdown("---")
-        
-        # [기능 복구] 제품 선택 시 실시간 기준값 조회 및 이력 표시
-        cp1, cp2, cp3 = st.columns(3)
-        with cp1: pd_name = st.selectbox("제품 선택", list(TARGET_DATA.keys()))
-        
-        tgt_val = get_historical_target(pd_name, p_date)
-        with cp2: st.metric("기준 색도", f"{float(tgt_val):.1f}")
-        with cp3: meas_val = st.number_input("측정 값", value=float(tgt_val), step=0.1)
+    for row in display_records:
+        equip_name, last_date_str, last_measured, last_status, _ = row
+        try:
+            last_date_obj = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+            is_old = (get_now_kst().date() - last_date_obj).days > 120
+        except:
+            is_old = False
+            
+        try:
+            last_measured_fmt = f"{float(last_measured):.1f}"
+        except:
+            last_measured_fmt = str(last_measured)
 
-        # [기능 복구] 설비별 생산 이력 경고 (4개월 초과 알림)
-        last_history = get_equipment_last_records(pd_name)
-        if last_history:
-            st.caption("⚙️ **설비별 최종 생산 기록**")
-            cols = st.columns(len(last_history[:3]))
-            for i, r in enumerate(last_history[:3]):
-                is_old = (get_now_kst().date() - datetime.strptime(r[1], "%Y-%m-%d").date()).days > 120
-                with cols[i]:
-                    label = f":red[**{r[0]} (4개월 초과!)**]" if is_old else f"**{r[0]}**"
-                    st.info(f"{label}\n최종: {r[1]} / 측정: {r[2]}")
+        display_date = f":red[**{last_date_str} (4개월 초과!)**]" if is_old else last_date_str
+        display_measured = f":red[**{last_measured_fmt} (이전 불합격!)**]" if "불합격" in last_status else str(last_measured_fmt)
+        
+        st.sidebar.info(f"⚙️ **{equip_name} 생산 이력**\n\n🕒 **이전 최종 생산일:** {display_date}\n\n📉 **이전 측정 색도:** {display_measured}")
+else:
+    st.sidebar.warning("이전 생산 기록이 없습니다 (최초 입력).")
 
-        # 등록 버튼
-        if st.button("데이터 등록하기", type="primary"):
-            # ... 등록 로직 ...
-            st.session_state['show_toast'] = f"{pd_name} 등록 완료!"
+st.sidebar.markdown("---")
+
+measured_value = st.sidebar.number_input("측정 색도 입력", value=float(target_value), step=0.1, format="%.1f")
+remarks_input = st.sidebar.text_input("특이사항 (선택사항)", placeholder="간단한 메모 입력")
+
+if st.sidebar.button("데이터 등록하기"):
+    if worker_name == "" or worker_name is None:
+        st.sidebar.warning("⚠️ 작업자 이름을 지정해 주세요!")
+    else:
+        if check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value):
+            st.sidebar.error("⚠️ 방금 동일한 측정값이 등록되었습니다. 중복 방지를 위해 30초 대기 후 다시 시도해주세요.")
+        else:
+            difference = round(measured_value - target_value, 1)
+            status = "합격 🟢" if abs(difference) <= 2.0 else "불합격 🔴"
+            
+            save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, difference, status, remarks_input, input_amount_val)
+            
+            st.cache_data.clear()
+            st.success(f"정상적으로 기록되었습니다.")
             st.rerun()
 
 # ==========================================
