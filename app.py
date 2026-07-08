@@ -300,8 +300,8 @@ ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 # ==========================================
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
-    if st.text_input("🔒 비밀번호", type="password") == ADMIN_PASSWORD:
-        try: st.download_button("💾 DB 백업", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream")
+    if st.text_input("🔒 비밀번호", type="password", key="admin_pw_input") == ADMIN_PASSWORD:
+        try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
         t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 엑셀 업로드", "📅 기준값 이력", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자"])
@@ -310,26 +310,27 @@ def admin_menu_dialog():
             tdf = history_df[history_df['생산일'] == today_str_kst]
             if tdf.empty: st.info("기록 없음")
             else:
-                mode = st.radio("보기", ["미확인 ❌", "확인완료 ✅"], horizontal=True)
+                mode = st.radio("보기", ["미확인 ❌", "확인완료 ✅"], horizontal=True, key="admin_view_mode")
                 sub_df = tdf[tdf['확인여부'] == mode]
                 st.dataframe(sub_df, hide_index=True)
                 if mode == "미확인 ❌":
-                    to_chk = st.multiselect("확인 처리", sub_df['고유번호'].tolist())
-                    if st.button("✅ 선택 확인"):
+                    to_chk = st.multiselect("확인 처리할 내역", sub_df['고유번호'].tolist(), key="admin_sel_confirm")
+                    if st.button("✅ 선택 확인 완료", key="admin_btn_confirm"):
                         update_checked_status(to_chk, 1)
                         st.cache_data.clear(); st.session_state['show_toast'] = "확인 완료!"; st.rerun()
                 else:
-                    to_unchk = st.multiselect("미확인 복구", sub_df['고유번호'].tolist())
-                    if st.button("🔄 선택 복구"):
+                    to_unchk = st.multiselect("미확인 복구 내역", sub_df['고유번호'].tolist(), key="admin_sel_unconfirm")
+                    if st.button("🔄 선택 복구", key="admin_btn_unconfirm"):
                         update_checked_status(to_unchk, 0)
                         st.cache_data.clear(); st.session_state['show_toast'] = "복구 완료!"; st.rerun()
         with t2:
             col1, col2 = st.columns(2)
             with col1:
-                tid = st.number_input("고유번호", min_value=1)
-                act = st.radio("작업", ["삭제", "수정"])
+                tid = st.number_input("고유번호", min_value=1, key="admin_num_id")
+                act = st.radio("작업", ["삭제", "수정"], key="admin_radio_action")
             with col2:
-                if act == "삭제" and st.button("🗑️ 삭제"):
+                # [에러 해결!] key 값을 완전히 분리했습니다.
+                if act == "삭제" and st.button("🗑️ 데이터 삭제", key="admin_btn_del_record"):
                     delete_from_db(tid); st.cache_data.clear(); st.session_state['show_toast'] = "삭제됨!"; st.rerun()
                 elif act == "수정":
                     conn = sqlite3.connect(DB_FILE)
@@ -339,24 +340,24 @@ def admin_menu_dialog():
                     row = c.execute(f"SELECT product_name, target_value, production_date, equipment, worker, measured_value, remarks, input_amount, COALESCE({chk_c}, 0) FROM color_records WHERE id=?", (tid,)).fetchone()
                     conn.close()
                     if row:
-                        npd = st.date_input("생산일", value=datetime.strptime(row[2], "%Y-%m-%d").date() if len(row[2])>5 else get_now_kst().date()).strftime("%Y-%m-%d")
+                        npd = st.date_input("생산일", value=datetime.strptime(row[2], "%Y-%m-%d").date() if len(row[2])>5 else get_now_kst().date(), key="admin_date_edit").strftime("%Y-%m-%d")
                         opts = list(TARGET_DATA.keys())
-                        nprod = st.selectbox("제품", opts, index=opts.index(row[0]) if row[0] in opts else 0)
-                        neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0)
-                        namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0) if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "120kg" if "120" in neq else "-")
-                        if "버닝" not in neq: st.text_input("투입량", namt, disabled=True)
-                        nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0)
-                        nm = st.number_input("측정", value=float(row[5]), step=0.1)
-                        nrm = st.text_input("특이사항", value=row[6])
-                        if st.button("✏️ 수정"):
+                        nprod = st.selectbox("제품", opts, index=opts.index(row[0]) if row[0] in opts else 0, key="admin_sel_prod")
+                        neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0, key="admin_sel_equip")
+                        namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "120kg" if "120" in neq else "-")
+                        if "버닝" not in neq: st.text_input("투입량", namt, disabled=True, key="admin_txt_amt")
+                        nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
+                        nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
+                        nrm = st.text_input("특이사항", value=row[6], key="admin_txt_rmk")
+                        if st.button("✏️ 수정 완료", key="admin_btn_edit_record"):
                             tgt = get_historical_target(nprod, npd)
                             diff = round(nm - tgt, 1)
                             stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
                             update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8])
                             st.cache_data.clear(); st.session_state['show_toast'] = "수정됨!"; st.rerun()
         with t3:
-            up = st.file_uploader("과거 엑셀", type=['xlsx', 'xls'])
-            if up and st.button("🚀 일괄 업로드"):
+            up = st.file_uploader("과거 엑셀", type=['xlsx', 'xls'], key="admin_file_record")
+            if up and st.button("🚀 일괄 업로드", key="admin_btn_upload_record"):
                 try:
                     df_up = pd.read_excel(up)
                     req = ['생산일', '제품명', '생산설비', '작업자', '측정색도']
@@ -381,8 +382,8 @@ def admin_menu_dialog():
                     else: st.error("❌ 필수 열 부족")
                 except Exception as e: st.error(e)
         with t4:
-            h_up = st.file_uploader("기준값 엑셀", type=['xlsx','xls'])
-            if h_up and st.button("🚀 이력 반영"):
+            h_up = st.file_uploader("기준값 엑셀", type=['xlsx','xls'], key="admin_file_history")
+            if h_up and st.button("🚀 이력 반영", key="admin_btn_upload_history"):
                 df_h = pd.read_excel(h_up)
                 if all(c in df_h.columns for c in ['제품명','적용시작일','기준색도']):
                     conn = sqlite3.connect(DB_FILE)
@@ -395,18 +396,20 @@ def admin_menu_dialog():
                     conn.commit(); conn.close()
                     st.cache_data.clear(); st.session_state['show_toast'] = "세팅 완료!"; st.rerun()
         with t5:
-            np = st.selectbox("제품", list(TARGET_DATA.keys()))
+            np = st.selectbox("제품", list(TARGET_DATA.keys()), key="admin_notice_prod")
             rn = get_raw_notice(np)
-            ntxt = st.text_area("내용", value=rn[0] if rn else "")
+            ntxt = st.text_area("내용", value=rn[0] if rn else "", key="admin_notice_text")
             c1, c2 = st.columns(2)
-            with c1: sd = st.date_input("시작", value=datetime.strptime(rn[1], "%Y-%m-%d").date() if rn else get_now_kst().date())
+            with c1: sd = st.date_input("시작", value=datetime.strptime(rn[1], "%Y-%m-%d").date() if rn else get_now_kst().date(), key="admin_notice_sd")
             with c2: 
-                nol = st.checkbox("무기한", value=(rn[2]=="2099-12-31") if rn else False)
-                ed = st.date_input("종료", disabled=nol)
-            if st.button("📢 등록/수정"):
+                nol = st.checkbox("무기한", value=(rn[2]=="2099-12-31") if rn else False, key="admin_notice_unlimit")
+                ed = st.date_input("종료", disabled=nol, key="admin_notice_ed")
+            if st.button("📢 공지 등록/수정", type="primary", key="admin_btn_save_notice"):
                 save_notice(np, ntxt, sd.strftime("%Y-%m-%d"), "2099-12-31" if nol else ed.strftime("%Y-%m-%d"))
                 st.cache_data.clear(); st.session_state['show_toast'] = "공지 등록!"; st.rerun()
-            if st.button("🗑️ 삭제"): delete_notice(np); st.cache_data.clear(); st.rerun()
+            # [에러 해결!] 데이터 삭제와 겹치지 않도록 key 고유값 부여
+            if st.button("🗑️ 공지 삭제", key="admin_btn_del_notice"): 
+                delete_notice(np); st.cache_data.clear(); st.rerun()
         with t6:
             inact = []
             td = get_now_kst().date()
@@ -427,12 +430,15 @@ def admin_menu_dialog():
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 st.dataframe(pd.DataFrame(ws).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}).sort_values(by="총", ascending=False), use_container_width=True, hide_index=True)
         with t8:
-            nw = st.text_input("새 작업자")
-            if st.button("➕ 추가") and add_worker(nw): st.cache_data.clear(); st.session_state['show_toast'] = "작업자 추가!"; st.rerun()
+            nw = st.text_input("새 작업자 이름", key="admin_new_worker")
+            if st.button("➕ 작업자 추가", type="primary", key="admin_btn_add_worker") and add_worker(nw): 
+                st.cache_data.clear(); st.session_state['show_toast'] = "작업자 추가!"; st.rerun()
             if CURRENT_WORKERS:
-                dw = st.selectbox("기존 작업자", CURRENT_WORKERS)
-                if st.button("➖ 삭제"): delete_worker(dw); st.cache_data.clear(); st.session_state['show_toast'] = "작업자 삭제!"; st.rerun()
-            if st.button("🧹 DB 전체 텍스트 공백 영구 정화"):
+                dw = st.selectbox("기존 작업자", CURRENT_WORKERS, key="admin_del_worker_sel")
+                # [에러 해결!] 작업자 삭제 고유 key
+                if st.button("➖ 작업자 삭제", key="admin_btn_del_worker"): 
+                    delete_worker(dw); st.cache_data.clear(); st.session_state['show_toast'] = "작업자 삭제!"; st.rerun()
+            if st.button("🧹 DB 텍스트 공백 정화", key="admin_btn_clean_db"):
                 conn = sqlite3.connect(DB_FILE)
                 c = conn.cursor()
                 c.execute("UPDATE color_records SET worker = TRIM(worker), equipment = TRIM(equipment), product_name = TRIM(product_name)")
@@ -441,54 +447,52 @@ def admin_menu_dialog():
     elif input_password != "": st.error("비밀번호 불일치")
 
 # ==========================================
-# 3. 메인 화면 구성 및 입력 동선
+# 3. 메인 화면 구성
 # ==========================================
 history_df = load_from_db() # 캐싱된 데이터
 
 c1, c2, c3 = st.columns([7, 1.5, 1])
 with c1: st.title("🎨 일일 제품 색도 관리 시스템")
 with c2: 
-    if st.button("🛠️ 관리자 메뉴", use_container_width=True): admin_menu_dialog()
+    if st.button("🛠️ 관리자 메뉴", use_container_width=True, key="main_btn_admin"): admin_menu_dialog()
 with c3:
-    if st.button("🔒 로그아웃", use_container_width=True):
+    if st.button("🔒 로그아웃", use_container_width=True, key="main_btn_logout"):
         st.query_params.clear(); st.session_state['logged_in'] = False; st.rerun()
 st.markdown("---")
 
-# [UI 개선 4 & 복구 기능] 입력 동선 메인 상단 통합 + 기준값/경고 기능 반영
+# [UI 개선 4 & 복구 기능] 메인 화면 상단 등록 (기준값/경고 알림 포함)
 st.subheader("📝 데이터 등록")
 tab_n, tab_q = st.tabs(["📋 일반 데이터 등록", "⚡ 진행 중인 라인 빠른 추가"])
 
 with tab_n:
     with st.container(border=True):
         cs1, cs2, cs3, cs4 = st.columns(4)
-        with cs1: prod_date_str = st.date_input("생산일 선택", value=get_now_kst().date()).strftime("%Y-%m-%d")
+        with cs1: prod_date_str = st.date_input("생산일 선택", value=get_now_kst().date(), key="main_date").strftime("%Y-%m-%d")
         with cs2: 
-            selected_equipment = st.selectbox("생산 설비 선택", EQUIPMENT_LIST)
+            selected_equipment = st.selectbox("생산 설비 선택", EQUIPMENT_LIST, key="main_equip")
             equip_clean = str(selected_equipment).lower().replace(" ", "")
-        with cs3: 
-            worker_name = st.selectbox("작업자 선택", CURRENT_WORKERS if CURRENT_WORKERS else [""])
+        with cs3: worker_name = st.selectbox("작업자 선택", CURRENT_WORKERS if CURRENT_WORKERS else [""], key="main_worker")
         with cs4:
-            if "버닝" in equip_clean:
-                input_amount_val = st.selectbox("원료 투입량 선택", ["1.35kg", "2.5kg", "3.75kg"])
+            if "버닝" in equip_clean: input_amount_val = st.selectbox("원료 투입량", ["1.35kg", "2.5kg", "3.75kg"], key="main_amt_sel")
             else:
                 input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "120kg" if "120" in equip_clean else "-"
-                st.text_input("투입량 (고정)", input_amount_val, disabled=True)
+                st.text_input("투입량 (고정)", input_amount_val, disabled=True, key="main_amt_txt")
                 
         st.markdown("---")
         
         col_p1, col_p2 = st.columns([2, 1])
         with col_p1:
-            selected_product = st.selectbox("🔍 제품명 검색 및 선택", list(TARGET_DATA.keys()))
+            selected_product = st.selectbox("🔍 제품명 검색 및 선택", list(TARGET_DATA.keys()), key="main_prod")
             if ACTIVE_NOTICES.get(selected_product): st.warning(f"📢 **전달사항:** {ACTIVE_NOTICES[selected_product]}")
         with col_p2:
             target_value = get_historical_target(selected_product, prod_date_str)
             st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
         
-        # [복구 기능] 설비별 생산 이력 및 4개월 초과 경고 알림 표시
+        # [복구 기능] 설비별 이전 생산 기록 및 4개월 초과 경고 표시
         last_records = get_equipment_last_records(selected_product)
         if last_records:
             st.caption("💡 **설비별 최근 생산 이력**")
-            display_records = last_records[:3] # 공간 확보를 위해 상위 3개 라인만 노출
+            display_records = last_records[:3]
             cols = st.columns(len(display_records))
             for idx, row in enumerate(display_records):
                 equip_name, last_date_str, last_measured, last_status, _ = row
@@ -499,15 +503,14 @@ with tab_n:
                 disp_date = f":red[**{last_date_str} (4개월 초과!)**]" if is_old else last_date_str
                 disp_meas = f":red[**{last_measured_fmt} (이전 불합격!)**]" if "불합격" in last_status else str(last_measured_fmt)
                 with cols[idx]: st.info(f"⚙️ **{equip_name}**\n\n🕒 {disp_date}\n\n📉 {disp_meas}")
-        else:
-            st.warning("이전 생산 기록이 없습니다 (최초 입력).")
+        else: st.warning("이전 생산 기록이 없습니다 (최초 입력).")
 
         cs8, cs9, cs10 = st.columns([2,2,1])
-        with cs8: measured_value = st.number_input("측정 색도 입력", value=float(target_value), step=0.1)
-        with cs9: remarks_input = st.text_input("특이사항 (선택사항)", placeholder="메모 입력")
+        with cs8: measured_value = st.number_input("측정 색도 입력", value=float(target_value), step=0.1, key="main_meas")
+        with cs9: remarks_input = st.text_input("특이사항 (선택사항)", placeholder="메모 입력", key="main_rmk")
         with cs10:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("데이터 등록하기", type="primary", use_container_width=True):
+            if st.button("등록하기", type="primary", use_container_width=True, key="main_btn_save"):
                 if not worker_name: st.warning("⚠️ 작업자 오류!")
                 elif check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value): st.error("⚠️ 중복 데이터!")
                 else:
@@ -523,16 +526,16 @@ with tab_q:
             rb = tdf[['제품명','생산설비','투입량','작업자']].drop_duplicates().reset_index(drop=True)
             opts = [f"▶ {r['제품명']} ({r['생산설비']} / {r['투입량']} / {r['작업자']})" for _,r in rb.iterrows()]
             cq1, cq2, cq3, cq4 = st.columns([3,1,1,1])
-            with cq1: sb = st.selectbox("이어서 측정할 제품", opts)
+            with cq1: sb = st.selectbox("이어서 측정할 제품", opts, key="quick_sel")
             if sb:
                 idx = opts.index(sb)
                 qp, qe, qa, qw = rb.iloc[idx]['제품명'], rb.iloc[idx]['생산설비'], rb.iloc[idx]['투입량'], rb.iloc[idx]['작업자']
                 qt = get_historical_target(qp, today_str_kst)
-                with cq2: st.text_input("기준", f"{float(qt):.1f}", disabled=True, key="qt")
-                with cq3: qm = st.number_input("측정값", value=float(qt), step=0.1, key="qm")
+                with cq2: st.text_input("기준", f"{float(qt):.1f}", disabled=True, key="quick_tgt")
+                with cq3: qm = st.number_input("측정값", value=float(qt), step=0.1, key="quick_meas")
                 with cq4:
                     st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("🚀 빠른 등록", type="primary", use_container_width=True):
+                    if st.button("🚀 1초 빠른 등록", type="primary", use_container_width=True, key="quick_btn"):
                         if check_recent_duplicate(today_str_kst, qe, qp, qm): st.error("⚠️ 중복")
                         else:
                             diff = round(qm - qt, 1)
@@ -542,14 +545,14 @@ with tab_q:
 st.markdown("---")
 st.subheader("📊 누적 측정 기록 조회")
 if st_autorefresh:
-    if st.checkbox("🔄 실시간 모니터링 켜기 (10초)"): st_autorefresh(interval=10000, key="arf")
+    if st.checkbox("🔄 실시간 모니터링 켜기 (10초)", key="arf_chk"): st_autorefresh(interval=10000, key="arf_run")
 
 cf1, cf2, cf3 = st.columns(3)
-with cf1: sq = st.text_input("🔍 검색").strip()
-with cf2: dm = st.radio("📅 기간", ["오늘", "전체", "특정 일자"], horizontal=True)
+with cf1: sq = st.text_input("🔍 검색", key="filter_sq").strip()
+with cf2: dm = st.radio("📅 기간", ["오늘", "전체", "특정 일자"], horizontal=True, key="filter_dm")
 fd_str = ""
 with cf3:
-    if dm == "특정 일자": fd_str = st.date_input("선택").strftime("%Y-%m-%d")
+    if dm == "특정 일자": fd_str = st.date_input("선택", key="filter_date").strftime("%Y-%m-%d")
 
 ddf = history_df.copy()
 if not ddf.empty:
@@ -574,7 +577,7 @@ for i, e in enumerate(pe):
     with mc[i+1]: st.metric(f"⚙️ {e}", f"{ec[e]} 건")
 st.markdown("<br>", unsafe_allow_html=True)
 
-# [UI 개선 3] 판정 결과의 조건부 서식 강화
+# [UI 개선 3] 판정 결과 조건부 서식 강화
 def hl_stat(s): return ['color: white; background-color: #E74C3C; font-weight: bold;' if '불합격' in str(v) else 'color: #27AE60; font-weight: bold;' for v in s]
 def hl_eq(s):
     clrs = []
@@ -593,5 +596,5 @@ if not ddf.empty:
     sdf = mdf.style.format({"측정색도":"{:.1f}", "기준색도":"{:.1f}", "오차":"{:.1f}"}, na_rep="-").apply(hl_eq, subset=['생산설비']).apply(hl_stat, subset=['판정']).set_properties(subset=['특이사항'], **{'background-color': '#E8DAEF', 'color': 'black', 'font-weight': 'bold'}).set_properties(subset=['제품명'], **{'font-weight': 'bold'})
     st.dataframe(sdf, use_container_width=True, hide_index=True)
     fn = f"색도측정_{today_str_kst if dm=='오늘' else fd_str if dm=='특정 일자' else '전체'}.xlsx"
-    st.download_button("📥 엑셀 다운로드", to_excel(mdf), fn)
+    st.download_button("📥 엑셀 다운로드", to_excel(mdf), fn, key="btn_download_excel")
 else: st.info("🔍 일치하는 기록이 없습니다.")
