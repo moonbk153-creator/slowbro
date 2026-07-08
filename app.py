@@ -424,9 +424,11 @@ def admin_menu_dialog():
             if not history_df.empty:
                 ws = []
                 for nm, grp in history_df.groupby('작업자'):
-                    tc, fc = len(grp), len(grp[grp['판정'].str.contains("불합격")])
+                    tc, fc = len(grp), len(grp[grp['판정'].str.contains("불합격", na=False)])
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
-                st.dataframe(pd.DataFrame(ws).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}).sort_values(by="총", ascending=False), use_container_width=True, hide_index=True)
+                # [에러 해결!] sort_values를 style 적용 전에 실행하도록 순서 정정
+                stats_df = pd.DataFrame(ws).sort_values(by="총", ascending=False)
+                st.dataframe(stats_df.style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), use_container_width=True, hide_index=True)
         with t8:
             nw = st.text_input("새 작업자 이름", key="admin_new_worker")
             if st.button("➕ 작업자 추가", type="primary", key="admin_btn_add_worker") and add_worker(nw): 
@@ -484,13 +486,10 @@ with tab_n:
             target_value = get_historical_target(selected_product, prod_date_str)
             st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
         
-        # ==========================================
-        # [핵심 로직] 설비별 이전 생산 기록 추출 및 1년(365일) 초과 기록 필터링 & 팝업 알림
-        # ==========================================
         last_records = get_equipment_last_records(selected_product)
         if last_records:
             valid_records = []
-            very_old_records = [] # 1년 이상 미생산 설비 리스트
+            very_old_records = [] 
             today_date = get_now_kst().date()
             
             for row in last_records:
@@ -498,22 +497,19 @@ with tab_n:
                 try: days_passed = (today_date - datetime.strptime(last_date_str, "%Y-%m-%d").date()).days
                 except: days_passed = 0
                 
-                # 365일 이상 경과한 기록은 표시용(valid) 리스트에서 뺌
                 if days_passed >= 365:
                     very_old_records.append(equip_name)
                 else:
                     valid_records.append(row)
             
-            # [팝업 및 알림] 1년 초과 기록이 하나라도 발견되면 팝업 토스트 및 시각적 에러 박스 발생
             if very_old_records:
                 old_eq_str = ", ".join(very_old_records)
                 st.toast(f"🚨 장기 미생산 알림! ({old_eq_str} 1년 초과)", icon="🚨")
                 st.error(f"🚨 **[경고] 1년 이상 장기 미생산 알림!**\n\n해당 제품은 다음 설비에서 1년 이상 생산된 적이 없습니다: **{old_eq_str}**\n생산 전 로스팅 포인트 및 기준 색도를 반드시 재점검하세요!", icon="🚨")
 
-            # 1년이 넘지 않은(365일 미만) 정상 & 4개월(120일) 초과 기록들만 화면에 출력
             if valid_records:
                 st.caption("💡 **설비별 최근 생산 이력**")
-                display_records = valid_records[:3] # 공간 확보를 위해 상위 3개 라인만 노출
+                display_records = valid_records[:3] 
                 cols = st.columns(len(display_records))
                 for idx, row in enumerate(display_records):
                     equip_name, last_date_str, last_measured, last_status, _ = row
@@ -599,7 +595,6 @@ for i, e in enumerate(pe):
     with mc[i+1]: st.metric(f"⚙️ {e}", f"{ec[e]} 건")
 st.markdown("<br>", unsafe_allow_html=True)
 
-# 판정 결과 조건부 서식 강화
 def hl_stat(s): return ['color: white; background-color: #E74C3C; font-weight: bold;' if '불합격' in str(v) else 'color: #27AE60; font-weight: bold;' for v in s]
 def hl_eq(s):
     clrs = []
