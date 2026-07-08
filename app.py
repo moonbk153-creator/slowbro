@@ -329,7 +329,6 @@ def admin_menu_dialog():
                 tid = st.number_input("고유번호", min_value=1, key="admin_num_id")
                 act = st.radio("작업", ["삭제", "수정"], key="admin_radio_action")
             with col2:
-                # [에러 해결!] key 값을 완전히 분리했습니다.
                 if act == "삭제" and st.button("🗑️ 데이터 삭제", key="admin_btn_del_record"):
                     delete_from_db(tid); st.cache_data.clear(); st.session_state['show_toast'] = "삭제됨!"; st.rerun()
                 elif act == "수정":
@@ -407,7 +406,6 @@ def admin_menu_dialog():
             if st.button("📢 공지 등록/수정", type="primary", key="admin_btn_save_notice"):
                 save_notice(np, ntxt, sd.strftime("%Y-%m-%d"), "2099-12-31" if nol else ed.strftime("%Y-%m-%d"))
                 st.cache_data.clear(); st.session_state['show_toast'] = "공지 등록!"; st.rerun()
-            # [에러 해결!] 데이터 삭제와 겹치지 않도록 key 고유값 부여
             if st.button("🗑️ 공지 삭제", key="admin_btn_del_notice"): 
                 delete_notice(np); st.cache_data.clear(); st.rerun()
         with t6:
@@ -435,7 +433,6 @@ def admin_menu_dialog():
                 st.cache_data.clear(); st.session_state['show_toast'] = "작업자 추가!"; st.rerun()
             if CURRENT_WORKERS:
                 dw = st.selectbox("기존 작업자", CURRENT_WORKERS, key="admin_del_worker_sel")
-                # [에러 해결!] 작업자 삭제 고유 key
                 if st.button("➖ 작업자 삭제", key="admin_btn_del_worker"): 
                     delete_worker(dw); st.cache_data.clear(); st.session_state['show_toast'] = "작업자 삭제!"; st.rerun()
             if st.button("🧹 DB 텍스트 공백 정화", key="admin_btn_clean_db"):
@@ -460,7 +457,6 @@ with c3:
         st.query_params.clear(); st.session_state['logged_in'] = False; st.rerun()
 st.markdown("---")
 
-# [UI 개선 4 & 복구 기능] 메인 화면 상단 등록 (기준값/경고 알림 포함)
 st.subheader("📝 데이터 등록")
 tab_n, tab_q = st.tabs(["📋 일반 데이터 등록", "⚡ 진행 중인 라인 빠른 추가"])
 
@@ -488,29 +484,55 @@ with tab_n:
             target_value = get_historical_target(selected_product, prod_date_str)
             st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
         
-        # [복구 기능] 설비별 이전 생산 기록 및 4개월 초과 경고 표시
+        # ==========================================
+        # [핵심 로직] 설비별 이전 생산 기록 추출 및 1년(365일) 초과 기록 필터링 & 팝업 알림
+        # ==========================================
         last_records = get_equipment_last_records(selected_product)
         if last_records:
-            st.caption("💡 **설비별 최근 생산 이력**")
-            display_records = last_records[:3]
-            cols = st.columns(len(display_records))
-            for idx, row in enumerate(display_records):
+            valid_records = []
+            very_old_records = [] # 1년 이상 미생산 설비 리스트
+            today_date = get_now_kst().date()
+            
+            for row in last_records:
                 equip_name, last_date_str, last_measured, last_status, _ = row
-                try: is_old = (get_now_kst().date() - datetime.strptime(last_date_str, "%Y-%m-%d").date()).days > 120
-                except: is_old = False
+                try: days_passed = (today_date - datetime.strptime(last_date_str, "%Y-%m-%d").date()).days
+                except: days_passed = 0
                 
-                last_measured_fmt = f"{float(last_measured):.1f}" if pd.notnull(last_measured) else str(last_measured)
-                disp_date = f":red[**{last_date_str} (4개월 초과!)**]" if is_old else last_date_str
-                disp_meas = f":red[**{last_measured_fmt} (이전 불합격!)**]" if "불합격" in last_status else str(last_measured_fmt)
-                with cols[idx]: st.info(f"⚙️ **{equip_name}**\n\n🕒 {disp_date}\n\n📉 {disp_meas}")
-        else: st.warning("이전 생산 기록이 없습니다 (최초 입력).")
+                # 365일 이상 경과한 기록은 표시용(valid) 리스트에서 뺌
+                if days_passed >= 365:
+                    very_old_records.append(equip_name)
+                else:
+                    valid_records.append(row)
+            
+            # [팝업 및 알림] 1년 초과 기록이 하나라도 발견되면 팝업 토스트 및 시각적 에러 박스 발생
+            if very_old_records:
+                old_eq_str = ", ".join(very_old_records)
+                st.toast(f"🚨 장기 미생산 알림! ({old_eq_str} 1년 초과)", icon="🚨")
+                st.error(f"🚨 **[경고] 1년 이상 장기 미생산 알림!**\n\n해당 제품은 다음 설비에서 1년 이상 생산된 적이 없습니다: **{old_eq_str}**\n생산 전 로스팅 포인트 및 기준 색도를 반드시 재점검하세요!", icon="🚨")
+
+            # 1년이 넘지 않은(365일 미만) 정상 & 4개월(120일) 초과 기록들만 화면에 출력
+            if valid_records:
+                st.caption("💡 **설비별 최근 생산 이력**")
+                display_records = valid_records[:3] # 공간 확보를 위해 상위 3개 라인만 노출
+                cols = st.columns(len(display_records))
+                for idx, row in enumerate(display_records):
+                    equip_name, last_date_str, last_measured, last_status, _ = row
+                    try: is_old = (today_date - datetime.strptime(last_date_str, "%Y-%m-%d").date()).days > 120
+                    except: is_old = False
+                    
+                    last_measured_fmt = f"{float(last_measured):.1f}" if pd.notnull(last_measured) else str(last_measured)
+                    disp_date = f":red[**{last_date_str} (4개월 초과!)**]" if is_old else last_date_str
+                    disp_meas = f":red[**{last_measured_fmt} (이전 불합격!)**]" if "불합격" in last_status else str(last_measured_fmt)
+                    with cols[idx]: st.info(f"⚙️ **{equip_name}**\n\n🕒 {disp_date}\n\n📉 {disp_meas}")
+        else: 
+            st.warning("이전 생산 기록이 없습니다 (최초 입력).")
 
         cs8, cs9, cs10 = st.columns([2,2,1])
         with cs8: measured_value = st.number_input("측정 색도 입력", value=float(target_value), step=0.1, key="main_meas")
         with cs9: remarks_input = st.text_input("특이사항 (선택사항)", placeholder="메모 입력", key="main_rmk")
         with cs10:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("등록하기", type="primary", use_container_width=True, key="main_btn_save"):
+            if st.button("데이터 등록하기", type="primary", use_container_width=True, key="main_btn_save"):
                 if not worker_name: st.warning("⚠️ 작업자 오류!")
                 elif check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value): st.error("⚠️ 중복 데이터!")
                 else:
@@ -577,7 +599,7 @@ for i, e in enumerate(pe):
     with mc[i+1]: st.metric(f"⚙️ {e}", f"{ec[e]} 건")
 st.markdown("<br>", unsafe_allow_html=True)
 
-# [UI 개선 3] 판정 결과 조건부 서식 강화
+# 판정 결과 조건부 서식 강화
 def hl_stat(s): return ['color: white; background-color: #E74C3C; font-weight: bold;' if '불합격' in str(v) else 'color: #27AE60; font-weight: bold;' for v in s]
 def hl_eq(s):
     clrs = []
