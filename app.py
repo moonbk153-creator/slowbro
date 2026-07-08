@@ -300,7 +300,10 @@ ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 # ==========================================
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
-    if st.text_input("🔒 비밀번호", type="password", key="admin_pw_input") == ADMIN_PASSWORD:
+    # [에러 수정] 변수 명확히 지정!
+    input_pw_admin = st.text_input("🔒 비밀번호를 입력하세요", type="password", key="admin_pw_input")
+    
+    if input_pw_admin == ADMIN_PASSWORD:
         try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
@@ -426,7 +429,6 @@ def admin_menu_dialog():
                 for nm, grp in history_df.groupby('작업자'):
                     tc, fc = len(grp), len(grp[grp['판정'].str.contains("불합격", na=False)])
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
-                # [에러 해결!] sort_values를 style 적용 전에 실행하도록 순서 정정
                 stats_df = pd.DataFrame(ws).sort_values(by="총", ascending=False)
                 st.dataframe(stats_df.style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), use_container_width=True, hide_index=True)
         with t8:
@@ -443,7 +445,7 @@ def admin_menu_dialog():
                 c.execute("UPDATE color_records SET worker = TRIM(worker), equipment = TRIM(equipment), product_name = TRIM(product_name)")
                 conn.commit(); conn.close()
                 st.cache_data.clear(); st.session_state['show_toast'] = "DB 정화 완료!"; st.rerun()
-    elif input_password != "": st.error("비밀번호 불일치")
+    elif input_pw_admin != "": st.error("❌ 비밀번호 불일치")
 
 # ==========================================
 # 3. 메인 화면 구성
