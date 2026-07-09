@@ -211,6 +211,7 @@ def load_from_db():
     df.loc[df['오차'].isna(), '판정'] = "오류"
     df['특이사항'] = df['특이사항'].fillna('')
 
+    # DB 로드 시점에서 내부적인 태그 처리를 위해 시간 역순 정렬
     df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
     df['특이사항'] = df['특이사항'].astype(str).str.replace("[마지막 배치 🏁]", "", regex=False).str.replace("[설비 첫 배치 🚀]", "", regex=False).str.replace("[기준값 변경 후 첫 생산 🔔]", "", regex=False).str.strip()
 
@@ -300,7 +301,6 @@ ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 # ==========================================
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
-    # [에러 수정] 변수 명확히 지정!
     input_pw_admin = st.text_input("🔒 비밀번호를 입력하세요", type="password", key="admin_pw_input")
     
     if input_pw_admin == ADMIN_PASSWORD:
@@ -581,11 +581,19 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
+        # [핵심 로직 추가] 설비별 정렬 및 제품 최초 생산시간을 기준으로 한 깔끔한 그룹화 정렬
         def eq_sort(v):
             c = str(v).replace(" ","").lower()
             return 0 if '버닝' in c else 1 if '태환' in c else 2 if '프로밧' in c else 3 if '60' in c else 4 if '120' in c else 5
+        
         ddf['s'] = ddf['생산설비'].apply(eq_sort)
-        ddf = ddf.sort_values(by=['s','고유번호'], ascending=[True, False]).drop(columns=['s'])
+        
+        # 제품별 가장 처음 생산된 배치의 고유번호를 찾아 그룹 묶음용 기준키(prod_first_id)로 설정
+        ddf['prod_first_id'] = ddf.groupby(['s', '제품명'])['고유번호'].transform('min')
+        
+        # 1. 설비순 -> 2. 제품 최초 등록순서대로 묶음 -> 3. 먼저 등록된 순서대로(시간순)
+        ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
+        ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
 tb = len(ddf)
 mt = "오늘" if dm=="오늘" else fd_str if dm=="특정 일자" else "전체"
