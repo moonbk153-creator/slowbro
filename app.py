@@ -4,8 +4,19 @@ import sqlite3
 from datetime import datetime, timedelta
 import io 
 import pytz
+import numpy as np
 
-# 자동 새로고침 라이브러리 로드 (안전장치 포함)
+# 한국 공휴일 라이브러리 로드 (없으면 주말만 제외)
+try:
+    import holidays
+    kr_holidays_dict = holidays.KR(years=range(2020, 2035))
+    KR_HOLIDAYS = [date for date in kr_holidays_dict.keys()]
+    HAS_HOLIDAYS = True
+except ImportError:
+    KR_HOLIDAYS = []
+    HAS_HOLIDAYS = False
+
+# 자동 새로고침 라이브러리 로드
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
@@ -306,7 +317,6 @@ def admin_menu_dialog():
         try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
-        # [관리자 전용] "🔮 AI 예측" 탭 추가
         t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 엑셀 업로드", "📅 기준값 이력", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자", "🔮 AI 예측"])
         
         with t1:
@@ -399,8 +409,8 @@ def admin_menu_dialog():
                     conn.commit(); conn.close()
                     st.cache_data.clear(); st.session_state['show_toast'] = "세팅 완료!"; st.rerun()
         with t5:
-            np = st.selectbox("제품", list(TARGET_DATA.keys()), key="admin_notice_prod")
-            rn = get_raw_notice(np)
+            np_prod = st.selectbox("제품", list(TARGET_DATA.keys()), key="admin_notice_prod")
+            rn = get_raw_notice(np_prod)
             ntxt = st.text_area("내용", value=rn[0] if rn else "", key="admin_notice_text")
             c1, c2 = st.columns(2)
             with c1: sd = st.date_input("시작", value=datetime.strptime(rn[1], "%Y-%m-%d").date() if rn else get_now_kst().date(), key="admin_notice_sd")
@@ -408,10 +418,10 @@ def admin_menu_dialog():
                 nol = st.checkbox("무기한", value=(rn[2]=="2099-12-31") if rn else False, key="admin_notice_unlimit")
                 ed = st.date_input("종료", disabled=nol, key="admin_notice_ed")
             if st.button("📢 공지 등록/수정", type="primary", key="admin_btn_save_notice"):
-                save_notice(np, ntxt, sd.strftime("%Y-%m-%d"), "2099-12-31" if nol else ed.strftime("%Y-%m-%d"))
+                save_notice(np_prod, ntxt, sd.strftime("%Y-%m-%d"), "2099-12-31" if nol else ed.strftime("%Y-%m-%d"))
                 st.cache_data.clear(); st.session_state['show_toast'] = "공지 등록!"; st.rerun()
             if st.button("🗑️ 공지 삭제", key="admin_btn_del_notice"): 
-                delete_notice(np); st.cache_data.clear(); st.rerun()
+                delete_notice(np_prod); st.cache_data.clear(); st.rerun()
         with t6:
             inact = []
             td = get_now_kst().date()
@@ -447,10 +457,12 @@ def admin_menu_dialog():
                 conn.commit(); conn.close()
                 st.cache_data.clear(); st.session_state['show_toast'] = "DB 정화 완료!"; st.rerun()
         
-        # [관리자 기능] AI 예측 탭
+        # [관리자 전용] "🔮 AI 예측" (영업일 기준 계산)
         with t9:
-            st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 **평균 생산 주기**를 분석하여, 다음 생산이 필요한 시점을 자동으로 예측합니다. (장기 미생산 및 1회 생산 제품 제외)")
-            
+            st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 **영업일 기준 평균 생산 주기**를 분석하여, 다음 생산이 필요한 시점을 예측합니다. (주말 및 공휴일 제외)")
+            if not HAS_HOLIDAYS:
+                st.warning("💡 **공휴일 자동 제외 기능**을 완벽히 켜려면 터미널에 `pip install holidays` 를 입력해 주세요. (현재는 토/일요일만 영업일에서 제외됩니다)")
+                
             predict_data = []
             today_d = get_now_kst().date()
             
@@ -468,13 +480,21 @@ def admin_menu_dialog():
                     
                     if days_since_last > 120: continue 
                     
-                    intervals = [(unique_dates[i] - unique_dates[i-1]).days for i in range(1, len(unique_dates))]
+                    # 순수 영업일(Business Days) 기준으로 간격 계산
+                    intervals = [int(np.busday_count(unique_dates[i-1], unique_dates[i], holidays=KR_HOLIDAYS)) for i in range(1, len(unique_dates))]
+                    if not intervals: continue
                     avg_interval = sum(intervals) / len(intervals)
                     
-                    next_date = last_date + timedelta(days=int(avg_interval))
-                    d_day = (next_date - today_d).days
+                    if avg_interval < 1: avg_interval = 1 # 최소 1영업일 보장
                     
-                    if d_day < 0: status_str = f"🚨 긴급 ({-d_day}일 지남)"
+                    # 평균 영업일수를 더해 다음 예상일 도출 (휴일이면 다음 평일로 밀어냄 roll='forward')
+                    next_date_np = np.busday_offset(last_date, int(avg_interval), roll='forward', holidays=KR_HOLIDAYS)
+                    next_date = pd.to_datetime(next_date_np).date()
+                    
+                    # 오늘 기준으로 D-Day (영업일 기준) 계산
+                    d_day = int(np.busday_count(today_d, next_date, holidays=KR_HOLIDAYS))
+                    
+                    if d_day < 0: status_str = f"🚨 긴급 ({-d_day}영업일 지남)"
                     elif d_day == 0: status_str = "🔥 오늘 생산 권장"
                     elif d_day <= 3: status_str = f"⚠️ D-{d_day} (임박)"
                     else: status_str = f"✅ D-{d_day} (여유)"
@@ -482,7 +502,7 @@ def admin_menu_dialog():
                     predict_data.append({
                         "제품명": prod,
                         "마지막 생산일": last_date.strftime("%Y-%m-%d"),
-                        "평균 생산 주기": f"약 {int(avg_interval)}일",
+                        "평균 생산 주기": f"약 {int(avg_interval)}영업일",
                         "다음 예상일": next_date.strftime("%Y-%m-%d"),
                         "생산 필요 상태": status_str,
                         "_sort": d_day
