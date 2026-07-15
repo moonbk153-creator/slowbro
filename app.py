@@ -211,7 +211,6 @@ def load_from_db():
     df.loc[df['오차'].isna(), '판정'] = "오류"
     df['특이사항'] = df['특이사항'].fillna('')
 
-    # DB 로드 시점에서 내부적인 태그 처리를 위해 시간 역순 정렬
     df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
     df['특이사항'] = df['특이사항'].astype(str).str.replace("[마지막 배치 🏁]", "", regex=False).str.replace("[설비 첫 배치 🚀]", "", regex=False).str.replace("[기준값 변경 후 첫 생산 🔔]", "", regex=False).str.strip()
 
@@ -297,7 +296,7 @@ today_str_kst = get_now_kst().strftime("%Y-%m-%d")
 ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 
 # ==========================================
-# [UI 개선 5] 모달 다이얼로그(st.dialog)를 활용한 관리자 메뉴
+# 모달 다이얼로그(st.dialog)를 활용한 관리자 메뉴
 # ==========================================
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
@@ -307,7 +306,9 @@ def admin_menu_dialog():
         try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
-        t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 엑셀 업로드", "📅 기준값 이력", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자"])
+        # [관리자 전용] "🔮 AI 예측" 탭 추가
+        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 엑셀 업로드", "📅 기준값 이력", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자", "🔮 AI 예측"])
+        
         with t1:
             st.info("오늘 생산된 배치 확인 관리")
             tdf = history_df[history_df['생산일'] == today_str_kst]
@@ -445,12 +446,68 @@ def admin_menu_dialog():
                 c.execute("UPDATE color_records SET worker = TRIM(worker), equipment = TRIM(equipment), product_name = TRIM(product_name)")
                 conn.commit(); conn.close()
                 st.cache_data.clear(); st.session_state['show_toast'] = "DB 정화 완료!"; st.rerun()
+        
+        # [관리자 기능] AI 예측 탭
+        with t9:
+            st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 **평균 생산 주기**를 분석하여, 다음 생산이 필요한 시점을 자동으로 예측합니다. (장기 미생산 및 1회 생산 제품 제외)")
+            
+            predict_data = []
+            today_d = get_now_kst().date()
+            
+            if not history_df.empty:
+                pdf = history_df[['생산일', '제품명']].copy()
+                pdf['생산일'] = pd.to_datetime(pdf['생산일'], errors='coerce').dt.date
+                pdf = pdf.dropna()
+                
+                for prod, group in pdf.groupby('제품명'):
+                    unique_dates = sorted(group['생산일'].drop_duplicates().tolist())
+                    if len(unique_dates) < 2: continue
+                    
+                    last_date = unique_dates[-1]
+                    days_since_last = (today_d - last_date).days
+                    
+                    if days_since_last > 120: continue 
+                    
+                    intervals = [(unique_dates[i] - unique_dates[i-1]).days for i in range(1, len(unique_dates))]
+                    avg_interval = sum(intervals) / len(intervals)
+                    
+                    next_date = last_date + timedelta(days=int(avg_interval))
+                    d_day = (next_date - today_d).days
+                    
+                    if d_day < 0: status_str = f"🚨 긴급 ({-d_day}일 지남)"
+                    elif d_day == 0: status_str = "🔥 오늘 생산 권장"
+                    elif d_day <= 3: status_str = f"⚠️ D-{d_day} (임박)"
+                    else: status_str = f"✅ D-{d_day} (여유)"
+                    
+                    predict_data.append({
+                        "제품명": prod,
+                        "마지막 생산일": last_date.strftime("%Y-%m-%d"),
+                        "평균 생산 주기": f"약 {int(avg_interval)}일",
+                        "다음 예상일": next_date.strftime("%Y-%m-%d"),
+                        "생산 필요 상태": status_str,
+                        "_sort": d_day
+                    })
+            
+            if predict_data:
+                pred_df = pd.DataFrame(predict_data).sort_values('_sort').drop(columns=['_sort'])
+                def hl_pred(s):
+                    colors = []
+                    for v in s:
+                        if '긴급' in str(v) or '오늘' in str(v): colors.append('background-color: #FADBD8; color: black; font-weight: bold;')
+                        elif '임박' in str(v): colors.append('background-color: #FCF3CF; color: black; font-weight: bold;')
+                        else: colors.append('')
+                    return colors
+                styled_pred = pred_df.style.apply(hl_pred, subset=['생산 필요 상태']).set_properties(**{'text-align': 'center'})
+                st.dataframe(styled_pred, use_container_width=True, hide_index=True)
+            else:
+                st.success("데이터가 부족하여 아직 예측할 수 없습니다. (최근 4개월 내 2회 이상 생산된 제품이 필요합니다.)")
+
     elif input_pw_admin != "": st.error("❌ 비밀번호 불일치")
 
 # ==========================================
 # 3. 메인 화면 구성
 # ==========================================
-history_df = load_from_db() # 캐싱된 데이터
+history_df = load_from_db()
 
 c1, c2, c3 = st.columns([7, 1.5, 1])
 with c1: st.title("🎨 일일 제품 색도 관리 시스템")
@@ -581,17 +638,12 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
-        # [핵심 로직 추가] 설비별 정렬 및 제품 최초 생산시간을 기준으로 한 깔끔한 그룹화 정렬
         def eq_sort(v):
             c = str(v).replace(" ","").lower()
             return 0 if '버닝' in c else 1 if '태환' in c else 2 if '프로밧' in c else 3 if '60' in c else 4 if '120' in c else 5
         
         ddf['s'] = ddf['생산설비'].apply(eq_sort)
-        
-        # 제품별 가장 처음 생산된 배치의 고유번호를 찾아 그룹 묶음용 기준키(prod_first_id)로 설정
         ddf['prod_first_id'] = ddf.groupby(['s', '제품명'])['고유번호'].transform('min')
-        
-        # 1. 설비순 -> 2. 제품 최초 등록순서대로 묶음 -> 3. 먼저 등록된 순서대로(시간순)
         ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
         ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
