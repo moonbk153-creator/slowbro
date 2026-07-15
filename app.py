@@ -195,10 +195,27 @@ def auto_fill_input_amount(row):
     return amt
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_from_db():
     conn = sqlite3.connect(DB_FILE)
-    q = """SELECT c.id as 고유번호, c.timestamp as 입력일시, c.production_date as 생산일, c.equipment as 생산설비, COALESCE(c.input_amount, '-') as 투입량, c.worker as 작업자, c.product_name as 제품명, c.measured_value as 측정색도, COALESCE(c.remarks, '') as 특이사항, COALESCE(c.checked, 0) as checked_status, COALESCE((SELECT target_value FROM target_history th WHERE th.product_name = c.product_name AND th.effective_date <= c.production_date ORDER BY th.effective_date DESC LIMIT 1), (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name ORDER BY th.effective_date ASC LIMIT 1), 0.0) as 기준색도 FROM color_records c"""
-    try: df = pd.read_sql_query(q, conn)
+    
+    # [복구됨] 생산일과 target_history의 적용일자를 비교하여 당시의 기준색도를 정확히 가져오는 쿼리
+    q = """
+    SELECT 
+        c.id as 고유번호, c.timestamp as 입력일시, c.production_date as 생산일, 
+        c.equipment as 생산설비, COALESCE(c.input_amount, '-') as 투입량, 
+        c.worker as 작업자, c.product_name as 제품명, c.measured_value as 측정색도, 
+        COALESCE(c.remarks, '') as 특이사항, COALESCE(c.checked, 0) as checked_status, 
+        COALESCE(
+            (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name AND th.effective_date <= c.production_date ORDER BY th.effective_date DESC LIMIT 1), 
+            (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name ORDER BY th.effective_date ASC LIMIT 1), 
+            0.0
+        ) as 기준색도 
+    FROM color_records c
+    """
+    
+    try: 
+        df = pd.read_sql_query(q, conn)
     except Exception: 
         conn.close()
         return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
@@ -207,6 +224,7 @@ def load_from_db():
         conn.close()
         return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
 
+    # [복구됨] 데이터 전처리 및 오차/판정 자동 계산
     df['생산일'] = df['생산일'].apply(safe_date_parse)
     df['제품명'] = df['제품명'].astype(str).str.strip()
     df['생산설비'] = df['생산설비'].astype(str).str.strip()
@@ -222,6 +240,7 @@ def load_from_db():
     df.loc[df['오차'].isna(), '판정'] = "오류"
     df['특이사항'] = df['특이사항'].fillna('')
 
+    # [복구됨] 특이사항 자동 태그 
     df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
     df['특이사항'] = df['특이사항'].astype(str).str.replace("[마지막 배치 🏁]", "", regex=False).str.replace("[설비 첫 배치 🚀]", "", regex=False).str.replace("[기준값 변경 후 첫 생산 🔔]", "", regex=False).str.strip()
 
@@ -243,7 +262,6 @@ def load_from_db():
     
     df['특이사항'] = df['특이사항'].str.strip()
     return df[['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
-
 def delete_from_db(r_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
