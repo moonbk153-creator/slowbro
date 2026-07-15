@@ -691,9 +691,36 @@ def hl_eq(s):
     return clrs
 
 if not ddf.empty:
-    mdf = ddf.drop(columns=['확인여부'], errors='ignore')
-    sdf = mdf.style.format({"측정색도":"{:.1f}", "기준색도":"{:.1f}", "오차":"{:.1f}"}, na_rep="-").apply(hl_eq, subset=['생산설비']).apply(hl_stat, subset=['판정']).set_properties(subset=['특이사항'], **{'background-color': '#E8DAEF', 'color': 'black', 'font-weight': 'bold'}).set_properties(subset=['제품명'], **{'font-weight': 'bold'})
-    st.dataframe(sdf, use_container_width=True, hide_index=True)
+    # 1. [먹통 방지] 전체 데이터를 한 번에 그리지 않고 100개씩 분할 (페이지네이션)
+    page_size = 100
+    total_pages = max(1, int(np.ceil(len(ddf) / page_size)))
+    
+    # 페이지 선택 UI
+    page = st.number_input("📄 페이지 선택", min_value=1, max_value=total_pages, value=1)
+    
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_df = ddf.iloc[start_idx:end_idx].copy()
+    
+    st.write(f"총 **{len(ddf)}**건 중 **{start_idx+1} ~ {min(end_idx, len(ddf))}**건 표시 중 (페이지 {page}/{total_pages})")
+    
+    # 현재 페이지 데이터만 표시용으로 가공
+    mdf = page_df.drop(columns=['확인여부'], errors='ignore')
+    
+    # 2. 스타일 적용 (기존 스타일 완벽 유지)
+    sdf = mdf.style.format({"측정색도":"{:.1f}", "기준색도":"{:.1f}", "오차":"{:.1f}"}, na_rep="-") \
+                   .apply(hl_eq, subset=['생산설비']) \
+                   .apply(hl_stat, subset=['판정']) \
+                   .set_properties(subset=['특이사항'], **{'background-color': '#E8DAEF', 'color': 'black', 'font-weight': 'bold'}) \
+                   .set_properties(subset=['제품명'], **{'font-weight': 'bold'})
+    
+    # 3. [에러 해결] st.dataframe 대신 HTML로 강제 렌더링 (API 에러 원천 차단)
+    st.markdown(sdf.to_html(), unsafe_allow_html=True)
+    
+    # 엑셀 다운로드는 화면에 보이는 100개가 아니라 '전체 데이터'를 받도록 원본 ddf 사용
     fn = f"색도측정_{today_str_kst if dm=='오늘' else fd_str if dm=='특정 일자' else '전체'}.xlsx"
-    st.download_button("📥 엑셀 다운로드", to_excel(mdf), fn, key="btn_download_excel")
-else: st.info("🔍 일치하는 기록이 없습니다.")
+    full_mdf = ddf.drop(columns=['확인여부'], errors='ignore')
+    st.download_button("📥 엑셀 전체 다운로드", to_excel(full_mdf), fn, key="btn_download_excel")
+    
+else: 
+    st.info("🔍 일치하는 기록이 없습니다.")
