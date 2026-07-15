@@ -6,15 +6,18 @@ import io
 import pytz
 import numpy as np
 
-# 한국 공휴일 라이브러리 로드 (없으면 주말만 제외)
+# 한국 공휴일 라이브러리 예외 처리
 try:
     import holidays
-    kr_holidays_dict = holidays.KR(years=range(2020, 2035))
-    KR_HOLIDAYS = [date for date in kr_holidays_dict.keys()]
     HAS_HOLIDAYS = True
 except ImportError:
-    KR_HOLIDAYS = []
     HAS_HOLIDAYS = False
+
+try: from streamlit_autorefresh import st_autorefresh
+except ImportError: st_autorefresh = None
+
+KST = pytz.timezone('Asia/Seoul')
+st.set_page_config(page_title="색도 관리 시스템", layout="wide")
 
 # 자동 새로고침 라이브러리 로드
 try:
@@ -692,8 +695,19 @@ def hl_eq(s):
 
 if not ddf.empty:
     mdf = ddf.drop(columns=['확인여부'], errors='ignore')
-    sdf = mdf.style.format({"측정색도":"{:.1f}", "기준색도":"{:.1f}", "오차":"{:.1f}"}, na_rep="-").apply(hl_eq, subset=['생산설비']).apply(hl_stat, subset=['판정']).set_properties(subset=['특이사항'], **{'background-color': '#E8DAEF', 'color': 'black', 'font-weight': 'bold'}).set_properties(subset=['제품명'], **{'font-weight': 'bold'})
-    st.dataframe(sdf, use_container_width=True, hide_index=True)
+    
+    # 1. 디자인이 적용된 Styler 객체 생성
+    sdf = mdf.style.format({"측정색도":"{:.1f}", "기준색도":"{:.1f}", "오차":"{:.1f}"}, na_rep="-") \
+                   .apply(hl_eq, subset=['생산설비']) \
+                   .apply(hl_stat, subset=['판정']) \
+                   .set_properties(subset=['특이사항'], **{'background-color': '#E8DAEF', 'color': 'black', 'font-weight': 'bold'}) \
+                   .set_properties(subset=['제품명'], **{'font-weight': 'bold'})
+    
+    # 2. st.dataframe 대신 st.table을 사용하거나, 
+    # 스타일 적용된 데이터는 st.write를 통해 표시하는 것이 오류 방지에 훨씬 강력합니다.
+    st.write(sdf) 
+    
     fn = f"색도측정_{today_str_kst if dm=='오늘' else fd_str if dm=='특정 일자' else '전체'}.xlsx"
     st.download_button("📥 엑셀 다운로드", to_excel(mdf), fn, key="btn_download_excel")
-else: st.info("🔍 일치하는 기록이 없습니다.")
+else: 
+    st.info("🔍 일치하는 기록이 없습니다.")
