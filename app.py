@@ -692,19 +692,15 @@ def hl_eq(s):
 if not ddf.empty:
     mdf = ddf.drop(columns=['확인여부'], errors='ignore')
     
-    # [수정된 출력부] Styler 객체 없이 데이터 프레임을 그대로 출력합니다.
-    # 스타일 적용 대신 가독성을 위해 판정 컬럼을 확인하기 쉽게 표시합니다.
-    st.dataframe(
-        mdf, 
-        use_container_width=True, 
-        hide_index=True,
-        column_config={
-            "판정": st.column_config.TextColumn("판정", help="🟢합격/🔴불합격"),
-            "측정색도": st.column_config.NumberColumn("측정색도", format="%.1f"),
-            "기준색도": st.column_config.NumberColumn("기준색도", format="%.1f"),
-            "오차": st.column_config.NumberColumn("오차", format="%.1f"),
-        }
-    )
+    # 스타일 적용 객체 생성
+    sdf = mdf.style.format({"측정색도":"{:.1f}", "기준색도":"{:.1f}", "오차":"{:.1f}"}, na_rep="-") \
+                   .apply(hl_eq, subset=['생산설비']) \
+                   .apply(hl_stat, subset=['판정']) \
+                   .set_properties(subset=['특이사항'], **{'background-color': '#E8DAEF', 'color': 'black', 'font-weight': 'bold'}) \
+                   .set_properties(subset=['제품명'], **{'font-weight': 'bold'})
+    
+    # [핵심] HTML로 변환하여 출력 (에러 방지 + 스타일 완벽 유지)
+    st.markdown(sdf.to_html(), unsafe_allow_html=True)
     
     fn = f"색도측정_{today_str_kst if dm=='오늘' else fd_str if dm=='특정 일자' else '전체'}.xlsx"
     st.download_button("📥 엑셀 다운로드", to_excel(mdf), fn, key="btn_download_excel")
