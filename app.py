@@ -314,7 +314,7 @@ today_str_kst = get_now_kst().strftime("%Y-%m-%d")
 ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 
 # ----------------------------------------------------
-# 3. 관리자 전용 메뉴 (9개 탭 전면 복구)
+# 3. 관리자 전용 메뉴 (9개 탭 완벽 보존 + 방어 코드 추가)
 # ----------------------------------------------------
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
@@ -357,14 +357,25 @@ def admin_menu_dialog():
                     row = conn.execute(f"SELECT product_name, target_value, production_date, equipment, worker, measured_value, remarks, input_amount, COALESCE({chk_c}, 0) FROM color_records WHERE id=?", (tid,)).fetchone()
                     conn.close()
                     if row:
-                        npd = st.date_input("생산일", value=datetime.strptime(row[2], "%Y-%m-%d").date() if len(row[2])>5 else get_now_kst().date(), key="admin_date_edit").strftime("%Y-%m-%d")
+                        # [안전코드] 날짜 파싱 실패 방지
+                        try:
+                            def_date = datetime.strptime(row[2], "%Y-%m-%d").date()
+                        except:
+                            def_date = get_now_kst().date()
+                        
+                        npd = st.date_input("생산일", value=def_date, key="admin_date_edit").strftime("%Y-%m-%d")
+                        
+                        # [안전코드] 삭제된 제품명이 DB에 남아있을 경우 에러(ValueError) 방지
                         opts = list(TARGET_DATA.keys())
-                        nprod = st.selectbox("제품", opts, index=opts.index(row[0]) if row[0] in opts else 0, key="admin_sel_prod")
+                        if row[0] not in opts: opts.append(row[0])
+                        
+                        nprod = st.selectbox("제품", opts, index=opts.index(row[0]), key="admin_sel_prod")
                         neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0, key="admin_sel_equip")
                         namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "120kg" if "120" in neq else "-")
                         nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
                         nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
                         nrm = st.text_input("특이사항", value=row[6], key="admin_txt_rmk")
+                        
                         if st.button("✏️ 수정 완료", key="admin_btn_edit_record"):
                             tgt = get_historical_target(nprod, npd)
                             diff = round(nm - tgt, 1)
@@ -382,7 +393,10 @@ def admin_menu_dialog():
                             if str(r['측정색도']).strip() in ['-', '', 'nan', 'None']: continue
                             try: meas = float(str(r['측정색도']).strip())
                             except: continue
+                            
                             p_dt = safe_date_parse(r['생산일'])
+                            if not p_dt: continue # [안전코드] 빈 줄 무시
+                            
                             pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
                             am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "120kg" if "120" in eq else "-")
                             rm = str(r.get('특이사항', '')).strip()
@@ -467,7 +481,7 @@ def admin_menu_dialog():
     elif input_pw_admin != "": st.error("❌ 비밀번호 불일치")
 
 # ----------------------------------------------------
-# 4. 메인 화면 출력부
+# 4. 메인 화면 (모든 탭 보존)
 # ----------------------------------------------------
 history_df = load_from_db()
 
@@ -481,9 +495,10 @@ with c3:
 
 st.markdown("---")
 st.subheader("📝 데이터 등록")
+
+# [복구 확인] 입력 2개 탭
 tab_n, tab_q = st.tabs(["📋 일반 데이터 등록", "⚡ 진행 중인 라인 빠른 추가"])
 
-# [복구] 일반 데이터 등록 탭
 with tab_n:
     with st.container(border=True):
         cs1, cs2, cs3, cs4 = st.columns(4)
@@ -539,7 +554,6 @@ with tab_n:
                     save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val)
                     st.cache_data.clear(); st.session_state['show_toast'] = "정상 등록 완료!"; st.rerun()
 
-# [복구] 빠른 추가 탭
 with tab_q:
     with st.container(border=True):
         tdf = history_df[history_df['생산일'] == today_str_kst]
@@ -591,7 +605,7 @@ if not ddf.empty:
         ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
         ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
-# [복구] 설비별 생산 배치 수 표시 요약(Metric)
+# [복구 확인] 설비별 메트릭 요약 화면
 if not ddf.empty:
     tb = len(ddf)
     mt = "오늘" if dm=="오늘" else fd_str if dm=="특정 일자" else "전체"
@@ -617,8 +631,8 @@ def hl_eq(s):
         else: clrs.append('')
     return clrs
 
+# [최적화 유지] HTML 변환, 페이지네이션, 엑셀 분리 다운로드
 if not ddf.empty:
-    # [페이지네이션 유지]
     page_size = 100
     total_pages = max(1, int(np.ceil(len(ddf) / page_size)))
     page = st.number_input("📄 페이지 선택", min_value=1, max_value=total_pages, value=1)
