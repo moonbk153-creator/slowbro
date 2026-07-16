@@ -6,11 +6,12 @@ import io
 import pytz
 import numpy as np
 
-# [최적화] 공휴일 로드 캐싱
+# [버그 수정됨] 공휴일 데이터를 Numpy가 인식할 수 있는 순수 리스트(List) 형태로 변환
 try:
     import holidays
     HAS_HOLIDAYS = True
-    KR_HOLIDAYS = holidays.KR(years=range(2020, 2035))
+    kr_holidays_dict = holidays.KR(years=range(2020, 2035))
+    KR_HOLIDAYS = [str(date) for date in kr_holidays_dict.keys()] # 문자열 리스트로 완벽 변환
 except ImportError:
     HAS_HOLIDAYS = False
     KR_HOLIDAYS = []
@@ -67,7 +68,6 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS product_notices (product_name TEXT PRIMARY KEY, notice_text TEXT, start_date TEXT, end_date TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS workers (name TEXT PRIMARY KEY)''')
     
-    # [핵심 속도 최적화] 데이터가 늘어나도 즉시 찾을 수 있도록 인덱스(DB Index) 강제 생성
     c.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_target_hist ON target_history(product_name, effective_date)")
     
@@ -162,7 +162,7 @@ def load_from_db():
     df['특이사항'] = df['특이사항'].str.strip()
     return df[['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
 
-# [최적화] AI 영업일 예측 결과를 메모리에 캐싱하여 관리자 탭 로딩 즉각 처리
+# [버그 수정됨] 날짜 결측치(None/NaT) 및 Numpy 에러 원천 차단
 @st.cache_data(show_spinner=False)
 def get_ai_predictions():
     df = load_from_db()
@@ -170,22 +170,23 @@ def get_ai_predictions():
     
     predict_data = []
     today_d = get_now_kst().date()
-    df['생산일_dt'] = pd.to_datetime(df['생산일']).dt.date
+    # 결측치가 있는 날짜 제거
+    df['생산일_dt'] = pd.to_datetime(df['생산일'], errors='coerce').dt.date
     
     for prod, group in df.groupby('제품명'):
-        unique_dates = sorted(group['생산일_dt'].drop_duplicates().tolist())
+        unique_dates = sorted(group['생산일_dt'].dropna().drop_duplicates().tolist())
         if len(unique_dates) < 2: continue
         
         last_date = unique_dates[-1]
         if (today_d - last_date).days > 120: continue 
         
-        intervals = [int(np.busday_count(unique_dates[i-1], unique_dates[i], holidays=KR_HOLIDAYS)) for i in range(1, len(unique_dates))]
+        intervals = [int(np.busday_count(str(unique_dates[i-1]), str(unique_dates[i]), holidays=KR_HOLIDAYS)) for i in range(1, len(unique_dates))]
         if not intervals: continue
         avg_interval = max(1, sum(intervals) / len(intervals))
         
-        next_date_np = np.busday_offset(last_date, int(avg_interval), roll='forward', holidays=KR_HOLIDAYS)
+        next_date_np = np.busday_offset(str(last_date), int(avg_interval), roll='forward', holidays=KR_HOLIDAYS)
         next_date = pd.to_datetime(next_date_np).date()
-        d_day = int(np.busday_count(today_d, next_date, holidays=KR_HOLIDAYS))
+        d_day = int(np.busday_count(str(today_d), str(next_date), holidays=KR_HOLIDAYS))
         
         if d_day < 0: status_str = f"🚨 긴급 ({-d_day}영업일 지남)"
         elif d_day == 0: status_str = "🔥 오늘 생산 권장"
@@ -362,7 +363,6 @@ fd_str = ""
 with cf3:
     if dm == "특정 일자": fd_str = st.date_input("선택").strftime("%Y-%m-%d")
 
-# [최적화] 데이터 필터링 연산을 즉시 처리
 ddf = history_df.copy()
 if not ddf.empty:
     if sq: ddf = ddf[ddf['제품명'].astype(str).str.contains(sq)]
@@ -370,7 +370,6 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
-        # [최적화] Apply 대신 Map 벡터화 연산으로 정렬 속도 100배 단축
         eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
         ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
         
@@ -378,7 +377,6 @@ if not ddf.empty:
         ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
         ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
-# 판정 결과 스타일 포맷 
 def hl_stat(s): return ['color: white; background-color: #E74C3C; font-weight: bold;' if '불합격' in str(v) else 'color: #27AE60; font-weight: bold;' for v in s]
 def hl_eq(s):
     clrs = []
@@ -395,7 +393,6 @@ def hl_eq(s):
 if not ddf.empty:
     st.write(f"총 **{len(ddf)}** 건의 기록이 있습니다.")
     
-    # [먹통 방지 페이지네이션]
     page_size = 100
     total_pages = max(1, int(np.ceil(len(ddf) / page_size)))
     page = st.number_input("📄 페이지 선택", min_value=1, max_value=total_pages, value=1)
@@ -406,7 +403,6 @@ if not ddf.empty:
     
     mdf = page_df.drop(columns=['확인여부'], errors='ignore')
     
-    # [최적화] 100건만 스타일을 입혀서 HTML 렌더링 속도 비약적 상승
     sdf = mdf.style.format({"측정색도":"{:.1f}", "기준색도":"{:.1f}", "오차":"{:.1f}"}, na_rep="-") \
                    .apply(hl_eq, subset=['생산설비']) \
                    .apply(hl_stat, subset=['판정']) \
