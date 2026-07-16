@@ -58,7 +58,7 @@ def safe_date_parse(val):
     except: return v
 
 # ----------------------------------------------------
-# 2. DB 관리 및 보조 함수 (전체 복구)
+# 2. DB 관리 및 보조 함수 
 # ----------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -591,6 +591,19 @@ if not ddf.empty:
         ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
         ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
+# [복구] 설비별 생산 배치 수 표시 요약(Metric)
+if not ddf.empty:
+    tb = len(ddf)
+    mt = "오늘" if dm=="오늘" else fd_str if dm=="특정 일자" else "전체"
+    ec = ddf['생산설비'].value_counts()
+    pe = [e for e in EQUIPMENT_LIST if e in ec.index]
+    
+    mc = st.columns(1 + len(pe))
+    with mc[0]: st.metric(f"📦 {mt} 배치", f"{tb} 건")
+    for i, e in enumerate(pe):
+        with mc[i+1]: st.metric(f"⚙️ {e}", f"{ec[e]} 건")
+    st.markdown("<br>", unsafe_allow_html=True)
+
 def hl_stat(s): return ['color: white; background-color: #E74C3C; font-weight: bold;' if '불합격' in str(v) else 'color: #27AE60; font-weight: bold;' for v in s]
 def hl_eq(s):
     clrs = []
@@ -604,10 +617,8 @@ def hl_eq(s):
         else: clrs.append('')
     return clrs
 
-# [최적화 유지] 페이지네이션 데이터 표 출력
 if not ddf.empty:
-    st.write(f"총 **{len(ddf)}** 건의 기록이 있습니다.")
-    
+    # [페이지네이션 유지]
     page_size = 100
     total_pages = max(1, int(np.ceil(len(ddf) / page_size)))
     page = st.number_input("📄 페이지 선택", min_value=1, max_value=total_pages, value=1)
