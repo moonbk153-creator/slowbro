@@ -6,12 +6,12 @@ import io
 import pytz
 import numpy as np
 
-# [버그 수정됨] 공휴일 데이터를 Numpy가 인식할 수 있는 순수 리스트(List) 형태로 변환
+# [최적화] 공휴일 로드 및 오류 방지
 try:
     import holidays
     HAS_HOLIDAYS = True
     kr_holidays_dict = holidays.KR(years=range(2020, 2035))
-    KR_HOLIDAYS = [str(date) for date in kr_holidays_dict.keys()] # 문자열 리스트로 완벽 변환
+    KR_HOLIDAYS = [str(date) for date in kr_holidays_dict.keys()]
 except ImportError:
     HAS_HOLIDAYS = False
     KR_HOLIDAYS = []
@@ -58,7 +58,7 @@ def safe_date_parse(val):
     except: return v
 
 # ----------------------------------------------------
-# 2. 초고속 데이터베이스 및 로딩 함수
+# 2. DB 관리 및 보조 함수 (전체 복구)
 # ----------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -88,6 +88,102 @@ def get_all_workers():
     rows = conn.execute("SELECT name FROM workers").fetchall()
     conn.close()
     return [r[0] for r in rows]
+
+def add_worker(name):
+    conn = sqlite3.connect(DB_FILE)
+    try: conn.execute("INSERT INTO workers (name) VALUES (?)", (name.strip(),)); conn.commit(); return True
+    except: return False
+    finally: conn.close()
+
+def delete_worker(name):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("DELETE FROM workers WHERE name = ?", (name,)); conn.commit(); conn.close()
+
+def update_checked_status(record_ids, status_val):
+    conn = sqlite3.connect(DB_FILE)
+    for r in record_ids: conn.execute("UPDATE color_records SET checked=? WHERE id=?", (status_val, r))
+    conn.commit(); conn.close()
+
+def delete_from_db(r_id):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("DELETE FROM color_records WHERE id = ?", (r_id,)); conn.commit(); conn.close()
+
+def update_db(r_id, d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt, chk=0):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('UPDATE color_records SET production_date=?, equipment=?, worker=?, product_name=?, target_value=?, measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=? WHERE id=?', 
+              (d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt, chk, r_id))
+    conn.commit(); conn.close()
+
+def sync_target_history(excel_dict):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    t_str = get_now_kst().strftime('%Y-%m-%d')
+    for p, v in excel_dict.items():
+        r = c.execute("SELECT target_value FROM target_history WHERE product_name=? ORDER BY effective_date DESC, id DESC LIMIT 1", (p,)).fetchone()
+        if r is None: c.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (p, v, '2000-01-01'))
+        elif float(r[0]) != float(v): c.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (p, v, t_str))
+    conn.commit(); conn.close()
+
+def get_historical_target(p_name, d_str):
+    conn = sqlite3.connect(DB_FILE)
+    r = conn.execute('SELECT target_value FROM target_history WHERE product_name=? AND effective_date <= ? ORDER BY effective_date DESC, id DESC LIMIT 1', (p_name, d_str)).fetchone()
+    conn.close()
+    return r[0] if r else TARGET_DATA.get(p_name, 0.0)
+
+def save_notice(p, txt, s_date, e_date):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('INSERT OR REPLACE INTO product_notices (product_name, notice_text, start_date, end_date) VALUES (?, ?, ?, ?)', (p, txt, s_date, e_date))
+    conn.commit(); conn.close()
+
+def delete_notice(p):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("DELETE FROM product_notices WHERE product_name = ?", (p,)); conn.commit(); conn.close()
+
+def get_all_active_notices(t_str):
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute('SELECT product_name, notice_text FROM product_notices WHERE start_date <= ? AND end_date >= ?', (t_str, t_str)).fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+def get_raw_notice(p):
+    conn = sqlite3.connect(DB_FILE)
+    r = conn.execute("SELECT notice_text, start_date, end_date FROM product_notices WHERE product_name=?", (p,)).fetchone()
+    conn.close()
+    return r
+
+def save_to_db(d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt):
+    ts = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 
+              (ts, d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt))
+    conn.commit(); conn.close()
+
+def check_recent_duplicate(d_date, eq, p, meas_val):
+    conn = sqlite3.connect(DB_FILE)
+    r = conn.execute('SELECT measured_value, timestamp FROM color_records WHERE production_date=? AND equipment=? AND product_name=? ORDER BY id DESC LIMIT 1', (d_date, str(eq).strip(), str(p).strip())).fetchone()
+    conn.close()
+    if r and float(r[0]) == float(meas_val):
+        try:
+            if (get_now_kst() - datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")).total_seconds() < 30: return True 
+        except: pass
+    return False
+
+def get_last_record(p):
+    conn = sqlite3.connect(DB_FILE)
+    r = conn.execute('SELECT production_date, measured_value, status FROM color_records WHERE product_name = ? ORDER BY production_date DESC, timestamp DESC LIMIT 1', (str(p).strip(),)).fetchone()
+    conn.close()
+    return r
+
+def get_equipment_last_records(p_name):
+    conn = sqlite3.connect(DB_FILE)
+    query = """
+        WITH RankedRecords AS (SELECT equipment, production_date, measured_value, status, id, ROW_NUMBER() OVER (PARTITION BY equipment ORDER BY production_date DESC, timestamp DESC, id DESC) as rn FROM color_records WHERE product_name = ?), 
+        EquipCounts AS (SELECT equipment, COUNT(*) as cnt FROM color_records WHERE product_name = ? GROUP BY equipment)
+        SELECT r.equipment, r.production_date, r.measured_value, r.status, c.cnt FROM RankedRecords r JOIN EquipCounts c ON r.equipment = c.equipment WHERE r.rn = 1 ORDER BY c.cnt DESC, r.production_date DESC
+    """
+    rows = conn.execute(query, (str(p_name).strip(), str(p_name).strip())).fetchall()
+    conn.close()
+    return rows
 
 def auto_fill_input_amount(row):
     eq = str(row['생산설비']).lower().replace(" ", "")
@@ -162,7 +258,6 @@ def load_from_db():
     df['특이사항'] = df['특이사항'].str.strip()
     return df[['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
 
-# [버그 수정됨] 날짜 결측치(None/NaT) 및 Numpy 에러 원천 차단
 @st.cache_data(show_spinner=False)
 def get_ai_predictions():
     df = load_from_db()
@@ -170,7 +265,6 @@ def get_ai_predictions():
     
     predict_data = []
     today_d = get_now_kst().date()
-    # 결측치가 있는 날짜 제거
     df['생산일_dt'] = pd.to_datetime(df['생산일'], errors='coerce').dt.date
     
     for prod, group in df.groupby('제품명'):
@@ -200,50 +294,6 @@ def get_ai_predictions():
         })
     return predict_data
 
-def sync_target_history(excel_dict):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    t_str = get_now_kst().strftime('%Y-%m-%d')
-    for p, v in excel_dict.items():
-        r = c.execute("SELECT target_value FROM target_history WHERE product_name=? ORDER BY effective_date DESC, id DESC LIMIT 1", (p,)).fetchone()
-        if r is None or float(r[0]) != float(v): 
-            c.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (p, v, t_str if r else '2000-01-01'))
-    conn.commit(); conn.close()
-
-def get_historical_target(p_name, d_str):
-    conn = sqlite3.connect(DB_FILE)
-    r = conn.execute('SELECT target_value FROM target_history WHERE product_name=? AND effective_date <= ? ORDER BY effective_date DESC, id DESC LIMIT 1', (p_name, d_str)).fetchone()
-    conn.close()
-    return r[0] if r else TARGET_DATA.get(p_name, 0.0)
-
-def save_to_db(d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt):
-    ts = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 
-              (ts, d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt))
-    conn.commit(); conn.close()
-
-def check_recent_duplicate(d_date, eq, p, meas_val):
-    conn = sqlite3.connect(DB_FILE)
-    r = conn.execute('SELECT measured_value, timestamp FROM color_records WHERE production_date=? AND equipment=? AND product_name=? ORDER BY id DESC LIMIT 1', (d_date, str(eq).strip(), str(p).strip())).fetchone()
-    conn.close()
-    if r and float(r[0]) == float(meas_val):
-        try:
-            if (get_now_kst() - datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")).total_seconds() < 30: return True 
-        except: pass
-    return False
-
-def get_equipment_last_records(p_name):
-    conn = sqlite3.connect(DB_FILE)
-    query = """
-        WITH RankedRecords AS (SELECT equipment, production_date, measured_value, status, id, ROW_NUMBER() OVER (PARTITION BY equipment ORDER BY production_date DESC, timestamp DESC, id DESC) as rn FROM color_records WHERE product_name = ?), 
-        EquipCounts AS (SELECT equipment, COUNT(*) as cnt FROM color_records WHERE product_name = ? GROUP BY equipment)
-        SELECT r.equipment, r.production_date, r.measured_value, r.status, c.cnt FROM RankedRecords r JOIN EquipCounts c ON r.equipment = c.equipment WHERE r.rn = 1 ORDER BY c.cnt DESC, r.production_date DESC
-    """
-    rows = conn.execute(query, (str(p_name).strip(), str(p_name).strip())).fetchall()
-    conn.close()
-    return rows
-
 @st.cache_data
 def to_excel(df):
     output = io.BytesIO()
@@ -261,40 +311,146 @@ def load_tgt():
 TARGET_DATA = load_tgt()
 sync_target_history(TARGET_DATA)
 today_str_kst = get_now_kst().strftime("%Y-%m-%d")
+ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 
 # ----------------------------------------------------
-# 3. 관리자 메뉴
+# 3. 관리자 전용 메뉴 (9개 탭 전면 복구)
 # ----------------------------------------------------
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
-    input_pw_admin = st.text_input("🔒 비밀번호를 입력하세요", type="password")
+    input_pw_admin = st.text_input("🔒 비밀번호를 입력하세요", type="password", key="admin_pw_input")
     
     if input_pw_admin == ADMIN_PASSWORD:
-        try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream")
+        try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
-        t1, t2, t3, t4 = st.tabs(["📝 데이터 수정/삭제", "👥 통계/작업자", "📢 공지/이력", "🔮 AI 예측(캐시)"])
+        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 엑셀 업로드", "📅 기준값 이력", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자", "🔮 AI 예측"])
         
         with t1:
-            st.info("데이터 수정 및 삭제")
-            tid = st.number_input("고유번호", min_value=1)
-            act = st.radio("작업", ["삭제", "수정"], horizontal=True)
-            if act == "삭제" and st.button("🗑️ 삭제"):
-                conn = sqlite3.connect(DB_FILE); conn.execute("DELETE FROM color_records WHERE id = ?", (tid,)); conn.commit(); conn.close()
-                st.cache_data.clear(); st.session_state['show_toast'] = "삭제됨!"; st.rerun()
-            elif act == "수정" and st.button("✏️ 수정(준비)"): st.warning("수정 기능 활성화 됨")
-                
+            st.info("오늘 생산된 배치 확인 관리")
+            tdf = history_df[history_df['생산일'] == today_str_kst]
+            if tdf.empty: st.info("기록 없음")
+            else:
+                mode = st.radio("보기", ["미확인 ❌", "확인완료 ✅"], horizontal=True, key="admin_view_mode")
+                sub_df = tdf[tdf['확인여부'] == mode]
+                st.dataframe(sub_df, hide_index=True)
+                if mode == "미확인 ❌":
+                    to_chk = st.multiselect("확인 처리할 내역", sub_df['고유번호'].tolist(), key="admin_sel_confirm")
+                    if st.button("✅ 선택 확인 완료", key="admin_btn_confirm"):
+                        update_checked_status(to_chk, 1); st.cache_data.clear(); st.session_state['show_toast'] = "확인 완료!"; st.rerun()
+                else:
+                    to_unchk = st.multiselect("미확인 복구 내역", sub_df['고유번호'].tolist(), key="admin_sel_unconfirm")
+                    if st.button("🔄 선택 복구", key="admin_btn_unconfirm"):
+                        update_checked_status(to_unchk, 0); st.cache_data.clear(); st.session_state['show_toast'] = "복구 완료!"; st.rerun()
         with t2:
-            st.info("통계 및 작업자 관리")
+            col1, col2 = st.columns(2)
+            with col1:
+                tid = st.number_input("고유번호", min_value=1, key="admin_num_id")
+                act = st.radio("작업", ["삭제", "수정"], key="admin_radio_action")
+            with col2:
+                if act == "삭제" and st.button("🗑️ 데이터 삭제", key="admin_btn_del_record"):
+                    delete_from_db(tid); st.cache_data.clear(); st.session_state['show_toast'] = "삭제됨!"; st.rerun()
+                elif act == "수정":
+                    conn = sqlite3.connect(DB_FILE)
+                    cols = [i[1] for i in conn.execute("PRAGMA table_info(color_records)").fetchall()]
+                    chk_c = "checked" if "checked" in cols else "0"
+                    row = conn.execute(f"SELECT product_name, target_value, production_date, equipment, worker, measured_value, remarks, input_amount, COALESCE({chk_c}, 0) FROM color_records WHERE id=?", (tid,)).fetchone()
+                    conn.close()
+                    if row:
+                        npd = st.date_input("생산일", value=datetime.strptime(row[2], "%Y-%m-%d").date() if len(row[2])>5 else get_now_kst().date(), key="admin_date_edit").strftime("%Y-%m-%d")
+                        opts = list(TARGET_DATA.keys())
+                        nprod = st.selectbox("제품", opts, index=opts.index(row[0]) if row[0] in opts else 0, key="admin_sel_prod")
+                        neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0, key="admin_sel_equip")
+                        namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "120kg" if "120" in neq else "-")
+                        nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
+                        nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
+                        nrm = st.text_input("특이사항", value=row[6], key="admin_txt_rmk")
+                        if st.button("✏️ 수정 완료", key="admin_btn_edit_record"):
+                            tgt = get_historical_target(nprod, npd)
+                            diff = round(nm - tgt, 1)
+                            stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
+                            update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8])
+                            st.cache_data.clear(); st.session_state['show_toast'] = "수정됨!"; st.rerun()
+        with t3:
+            up = st.file_uploader("과거 엑셀", type=['xlsx', 'xls'], key="admin_file_record")
+            if up and st.button("🚀 일괄 업로드", key="admin_btn_upload_record"):
+                try:
+                    df_up = pd.read_excel(up)
+                    if all(c in df_up.columns for c in ['생산일', '제품명', '생산설비', '작업자', '측정색도']):
+                        conn = sqlite3.connect(DB_FILE)
+                        for _, r in df_up.iterrows():
+                            if str(r['측정색도']).strip() in ['-', '', 'nan', 'None']: continue
+                            try: meas = float(str(r['측정색도']).strip())
+                            except: continue
+                            p_dt = safe_date_parse(r['생산일'])
+                            pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
+                            am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "120kg" if "120" in eq else "-")
+                            rm = str(r.get('특이사항', '')).strip()
+                            tgt = get_historical_target(pd_name, p_dt)
+                            diff = round(meas - tgt, 1)
+                            stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
+                            conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (get_now_kst().strftime("%Y-%m-%d %H:%M:%S"), p_dt, eq, wk, pd_name, tgt, meas, diff, stat, rm if rm not in ['nan','None'] else '', am))
+                        conn.commit(); conn.close()
+                        st.cache_data.clear(); st.session_state['show_toast'] = "엑셀 업로드 성공!"; st.rerun()
+                except Exception as e: st.error(e)
+        with t4:
+            h_up = st.file_uploader("기준값 엑셀", type=['xlsx','xls'], key="admin_file_history")
+            if h_up and st.button("🚀 이력 반영", key="admin_btn_upload_history"):
+                df_h = pd.read_excel(h_up)
+                if all(c in df_h.columns for c in ['제품명','적용시작일','기준색도']):
+                    conn = sqlite3.connect(DB_FILE)
+                    conn.execute("DELETE FROM target_history")
+                    for _, r in df_h.iterrows():
+                        dt = safe_date_parse(r['적용시작일']) or '2000-01-01'
+                        try: conn.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (str(r['제품명']).strip(), float(r['기준색도']), dt))
+                        except: pass
+                    conn.commit(); conn.close()
+                    st.cache_data.clear(); st.session_state['show_toast'] = "세팅 완료!"; st.rerun()
+        with t5:
+            np_prod = st.selectbox("제품", list(TARGET_DATA.keys()), key="admin_notice_prod")
+            rn = get_raw_notice(np_prod)
+            ntxt = st.text_area("내용", value=rn[0] if rn else "", key="admin_notice_text")
+            c1, c2 = st.columns(2)
+            with c1: sd = st.date_input("시작", value=datetime.strptime(rn[1], "%Y-%m-%d").date() if rn else get_now_kst().date(), key="admin_notice_sd")
+            with c2: 
+                nol = st.checkbox("무기한", value=(rn[2]=="2099-12-31") if rn else False, key="admin_notice_unlimit")
+                ed = st.date_input("종료", disabled=nol, key="admin_notice_ed")
+            if st.button("📢 공지 등록/수정", type="primary", key="admin_btn_save_notice"):
+                save_notice(np_prod, ntxt, sd.strftime("%Y-%m-%d"), "2099-12-31" if nol else ed.strftime("%Y-%m-%d"))
+                st.cache_data.clear(); st.session_state['show_toast'] = "공지 등록!"; st.rerun()
+            if st.button("🗑️ 공지 삭제", key="admin_btn_del_notice"): delete_notice(np_prod); st.cache_data.clear(); st.rerun()
+        with t6:
+            inact = []
+            td = get_now_kst().date()
+            for p in TARGET_DATA.keys():
+                lr = get_last_record(p)
+                if lr:
+                    try:
+                        d = (td - datetime.strptime(lr[0], "%Y-%m-%d").date()).days
+                        if d >= 120: inact.append({"제품명":p, "최종 생산":lr[0], "경과":f"{d}일"})
+                    except: pass
+                else: inact.append({"제품명":p, "최종 생산":"없음", "경과":"이력 없음"})
+            st.dataframe(pd.DataFrame(inact), use_container_width=True, hide_index=True)
+        with t7:
             if not history_df.empty:
                 ws = []
                 for nm, grp in history_df.groupby('작업자'):
                     tc, fc = len(grp), len(grp[grp['판정'].str.contains("불합격", na=False)])
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 st.dataframe(pd.DataFrame(ws).sort_values(by="총", ascending=False).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
-
-        with t4:
-            st.info("최근 4개월 이내 생산된 제품들의 영업일 기준 예측 (즉시 로딩)")
+        with t8:
+            nw = st.text_input("새 작업자 이름", key="admin_new_worker")
+            if st.button("➕ 작업자 추가", type="primary", key="admin_btn_add_worker") and add_worker(nw): st.cache_data.clear(); st.session_state['show_toast'] = "작업자 추가!"; st.rerun()
+            if CURRENT_WORKERS:
+                dw = st.selectbox("기존 작업자", CURRENT_WORKERS, key="admin_del_worker_sel")
+                if st.button("➖ 작업자 삭제", key="admin_btn_del_worker"): delete_worker(dw); st.cache_data.clear(); st.session_state['show_toast'] = "작업자 삭제!"; st.rerun()
+            if st.button("🧹 DB 텍스트 공백 정화", key="admin_btn_clean_db"):
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute("UPDATE color_records SET worker = TRIM(worker), equipment = TRIM(equipment), product_name = TRIM(product_name)")
+                conn.commit(); conn.close()
+                st.cache_data.clear(); st.session_state['show_toast'] = "DB 정화 완료!"; st.rerun()
+        with t9:
+            st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
             pred_data = get_ai_predictions()
             if pred_data:
                 pred_df = pd.DataFrame(pred_data).sort_values('_sort').drop(columns=['_sort'])
@@ -308,9 +464,10 @@ def admin_menu_dialog():
                 st.dataframe(pred_df.style.apply(hl_pred, subset=['생산 필요 상태']).set_properties(**{'text-align': 'center'}), use_container_width=True, hide_index=True)
             else:
                 st.success("데이터가 부족하여 아직 예측할 수 없습니다.")
+    elif input_pw_admin != "": st.error("❌ 비밀번호 불일치")
 
 # ----------------------------------------------------
-# 4. 메인 화면 및 빠른 데이터 필터링
+# 4. 메인 화면 출력부
 # ----------------------------------------------------
 history_df = load_from_db()
 
@@ -324,44 +481,101 @@ with c3:
 
 st.markdown("---")
 st.subheader("📝 데이터 등록")
-with st.container(border=True):
-    cs1, cs2, cs3, cs4 = st.columns(4)
-    with cs1: prod_date_str = st.date_input("생산일 선택", value=get_now_kst().date()).strftime("%Y-%m-%d")
-    with cs2: selected_equipment = st.selectbox("생산 설비 선택", EQUIPMENT_LIST)
-    with cs3: worker_name = st.selectbox("작업자 선택", CURRENT_WORKERS if CURRENT_WORKERS else [""])
-    with cs4: input_amount_val = st.selectbox("투입량", ["12kg", "25kg", "60kg", "120kg", "1.35kg", "2.5kg", "3.75kg"])
-            
-    col_p1, col_p2 = st.columns([2, 1])
-    with col_p1: selected_product = st.selectbox("🔍 제품명 검색 및 선택", list(TARGET_DATA.keys()))
-    with col_p2:
-        target_value = get_historical_target(selected_product, prod_date_str)
-        st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
-    
-    cs8, cs9, cs10 = st.columns([2,2,1])
-    with cs8: measured_value = st.number_input("측정 색도 입력", value=float(target_value), step=0.1)
-    with cs9: remarks_input = st.text_input("특이사항 (선택사항)", placeholder="메모 입력")
-    with cs10:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("데이터 등록하기", type="primary", use_container_width=True):
-            if not worker_name: st.warning("⚠️ 작업자 오류!")
-            elif check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value): st.error("⚠️ 중복 데이터!")
+tab_n, tab_q = st.tabs(["📋 일반 데이터 등록", "⚡ 진행 중인 라인 빠른 추가"])
+
+# [복구] 일반 데이터 등록 탭
+with tab_n:
+    with st.container(border=True):
+        cs1, cs2, cs3, cs4 = st.columns(4)
+        with cs1: prod_date_str = st.date_input("생산일 선택", value=get_now_kst().date(), key="main_date").strftime("%Y-%m-%d")
+        with cs2: 
+            selected_equipment = st.selectbox("생산 설비 선택", EQUIPMENT_LIST, key="main_equip")
+            equip_clean = str(selected_equipment).lower().replace(" ", "")
+        with cs3: worker_name = st.selectbox("작업자 선택", CURRENT_WORKERS if CURRENT_WORKERS else [""], key="main_worker")
+        with cs4:
+            if "버닝" in equip_clean: input_amount_val = st.selectbox("원료 투입량", ["1.35kg", "2.5kg", "3.75kg"], key="main_amt_sel")
             else:
-                diff = round(measured_value - target_value, 1)
-                save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val)
-                st.cache_data.clear(); st.session_state['show_toast'] = "정상 등록 완료!"; st.rerun()
+                input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "120kg" if "120" in equip_clean else "-"
+                st.text_input("투입량 (고정)", input_amount_val, disabled=True, key="main_amt_txt")
+                
+        col_p1, col_p2 = st.columns([2, 1])
+        with col_p1:
+            selected_product = st.selectbox("🔍 제품명 검색 및 선택", list(TARGET_DATA.keys()), key="main_prod")
+            if ACTIVE_NOTICES.get(selected_product): st.warning(f"📢 **전달사항:** {ACTIVE_NOTICES[selected_product]}")
+        with col_p2:
+            target_value = get_historical_target(selected_product, prod_date_str)
+            st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
+        
+        last_records = get_equipment_last_records(selected_product)
+        if last_records:
+            valid_records, very_old_records = [], []
+            today_date = get_now_kst().date()
+            for row in last_records:
+                try: days_passed = (today_date - datetime.strptime(row[1], "%Y-%m-%d").date()).days
+                except: days_passed = 0
+                if days_passed >= 365: very_old_records.append(row[0])
+                else: valid_records.append(row)
+            if very_old_records:
+                st.error(f"🚨 **[경고] 1년 이상 장기 미생산 알림!**\n\n다음 설비에서 1년 이상 생산된 적이 없습니다: **{', '.join(very_old_records)}**")
+            if valid_records:
+                st.caption("💡 **설비별 최근 생산 이력**")
+                cols = st.columns(len(valid_records[:3]))
+                for idx, row in enumerate(valid_records[:3]):
+                    disp_date = f":red[**{row[1]} (4개월 초과)**]" if (today_date - datetime.strptime(row[1], "%Y-%m-%d").date()).days > 120 else row[1]
+                    disp_meas = f":red[**{float(row[2]):.1f} (이전 불합격!)**]" if "불합격" in row[3] else f"{float(row[2]):.1f}"
+                    with cols[idx]: st.info(f"⚙️ **{row[0]}**\n\n🕒 {disp_date}\n\n📉 {disp_meas}")
+        else: st.warning("이전 생산 기록이 없습니다.")
+
+        cs8, cs9, cs10 = st.columns([2,2,1])
+        with cs8: measured_value = st.number_input("측정 색도 입력", value=float(target_value), step=0.1, key="main_meas")
+        with cs9: remarks_input = st.text_input("특이사항 (선택사항)", placeholder="메모 입력", key="main_rmk")
+        with cs10:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("데이터 등록하기", type="primary", use_container_width=True, key="main_btn_save"):
+                if not worker_name: st.warning("⚠️ 작업자 오류!")
+                elif check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value): st.error("⚠️ 중복 데이터!")
+                else:
+                    diff = round(measured_value - target_value, 1)
+                    save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val)
+                    st.cache_data.clear(); st.session_state['show_toast'] = "정상 등록 완료!"; st.rerun()
+
+# [복구] 빠른 추가 탭
+with tab_q:
+    with st.container(border=True):
+        tdf = history_df[history_df['생산일'] == today_str_kst]
+        if tdf.empty: st.info("오늘 첫 생산을 일반 탭에서 진행해주세요.")
+        else:
+            rb = tdf[['제품명','생산설비','투입량','작업자']].drop_duplicates().reset_index(drop=True)
+            opts = [f"▶ {r['제품명']} ({r['생산설비']} / {r['투입량']} / {r['작업자']})" for _,r in rb.iterrows()]
+            cq1, cq2, cq3, cq4 = st.columns([3,1,1,1])
+            with cq1: sb = st.selectbox("이어서 측정할 제품", opts, key="quick_sel")
+            if sb:
+                idx = opts.index(sb)
+                qp, qe, qa, qw = rb.iloc[idx]['제품명'], rb.iloc[idx]['생산설비'], rb.iloc[idx]['투입량'], rb.iloc[idx]['작업자']
+                qt = get_historical_target(qp, today_str_kst)
+                with cq2: st.text_input("기준", f"{float(qt):.1f}", disabled=True, key="quick_tgt")
+                with cq3: qm = st.number_input("측정값", value=float(qt), step=0.1, key="quick_meas")
+                with cq4:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("🚀 1초 빠른 등록", type="primary", use_container_width=True, key="quick_btn"):
+                        if check_recent_duplicate(today_str_kst, qe, qp, qm): st.error("⚠️ 중복")
+                        else:
+                            diff = round(qm - qt, 1)
+                            save_to_db(today_str_kst, qe, qw, qp, qt, qm, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", "", qa)
+                            st.cache_data.clear(); st.session_state['show_toast'] = "빠른 등록 완료!"; st.rerun()
 
 st.markdown("---")
 st.subheader("📊 누적 측정 기록 조회")
 
 if st_autorefresh:
-    if st.checkbox("🔄 실시간 모니터링 켜기 (10초)"): st_autorefresh(interval=10000)
+    if st.checkbox("🔄 실시간 모니터링 켜기 (10초)", key="arf_chk"): st_autorefresh(interval=10000)
 
 cf1, cf2, cf3 = st.columns(3)
-with cf1: sq = st.text_input("🔍 검색").strip()
-with cf2: dm = st.radio("📅 기간", ["오늘", "전체", "특정 일자"], horizontal=True)
+with cf1: sq = st.text_input("🔍 검색", key="filter_sq").strip()
+with cf2: dm = st.radio("📅 기간", ["오늘", "전체", "특정 일자"], horizontal=True, key="filter_dm")
 fd_str = ""
 with cf3:
-    if dm == "특정 일자": fd_str = st.date_input("선택").strftime("%Y-%m-%d")
+    if dm == "특정 일자": fd_str = st.date_input("선택", key="filter_date").strftime("%Y-%m-%d")
 
 ddf = history_df.copy()
 if not ddf.empty:
@@ -390,6 +604,7 @@ def hl_eq(s):
         else: clrs.append('')
     return clrs
 
+# [최적화 유지] 페이지네이션 데이터 표 출력
 if not ddf.empty:
     st.write(f"총 **{len(ddf)}** 건의 기록이 있습니다.")
     
@@ -413,6 +628,6 @@ if not ddf.empty:
     
     fn = f"색도측정_{today_str_kst if dm=='오늘' else fd_str if dm=='특정 일자' else '전체'}.xlsx"
     full_mdf = ddf.drop(columns=['확인여부'], errors='ignore')
-    st.download_button("📥 엑셀 전체 다운로드", to_excel(full_mdf), fn)
+    st.download_button("📥 엑셀 전체 다운로드", to_excel(full_mdf), fn, key="btn_download_excel")
 else: 
     st.info("🔍 일치하는 기록이 없습니다.")
