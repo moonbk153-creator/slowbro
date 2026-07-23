@@ -114,16 +114,6 @@ def update_db(r_id, d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt, chk=0
               (d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt, chk, r_id))
     conn.commit(); conn.close()
 
-def sync_target_history(excel_dict):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    t_str = get_now_kst().strftime('%Y-%m-%d')
-    for p, v in excel_dict.items():
-        r = c.execute("SELECT target_value FROM target_history WHERE product_name=? ORDER BY effective_date DESC, id DESC LIMIT 1", (p,)).fetchone()
-        if r is None: c.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (p, v, '2000-01-01'))
-        elif float(r[0]) != float(v): c.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (p, v, t_str))
-    conn.commit(); conn.close()
-
 def get_historical_target(p_name, d_str):
     conn = sqlite3.connect(DB_FILE)
     r = conn.execute('SELECT target_value FROM target_history WHERE product_name=? AND effective_date <= ? ORDER BY effective_date DESC, id DESC LIMIT 1', (p_name, d_str)).fetchone()
@@ -303,18 +293,34 @@ def to_excel(df):
 init_db() 
 CURRENT_WORKERS = get_all_workers()
 
+# [핵심 픽스] TARGET_DATA를 DB에서 직접 긁어오도록 설계 변경 (즉각 동기화 지원)
 @st.cache_data
 def load_tgt():
-    try: return {str(r.iloc[0]).strip(): float(r.iloc[1]) if not pd.isna(r.iloc[1]) else 0.0 for i, r in pd.read_excel(EXCEL_FILE, usecols="C:D", header=1).dropna().iterrows()}
-    except: return {"(엑셀 파일 없음)": 0.0}
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute("SELECT product_name, target_value FROM target_history ORDER BY effective_date ASC, id ASC").fetchall()
+    conn.close()
+    
+    if rows:
+        return {r[0]: r[1] for r in rows}
+    else:
+        # DB가 비어있을 경우에만 로컬 엑셀을 1회 읽어 DB에 저장
+        try: 
+            df = pd.read_excel(EXCEL_FILE, usecols="C:D", header=1).dropna()
+            targets = {str(r.iloc[0]).strip(): float(r.iloc[1]) if not pd.isna(r.iloc[1]) else 0.0 for i, r in df.iterrows()}
+            conn = sqlite3.connect(DB_FILE)
+            for p, v in targets.items():
+                conn.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (p, v, '2000-01-01'))
+            conn.commit(); conn.close()
+            return targets
+        except: 
+            return {"(데이터 없음)": 0.0}
 
 TARGET_DATA = load_tgt()
-sync_target_history(TARGET_DATA)
 today_str_kst = get_now_kst().strftime("%Y-%m-%d")
 ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 
 # ----------------------------------------------------
-# 3. 관리자 전용 메뉴 (9개 탭 완벽 보존 + 방어 코드 추가)
+# 3. 관리자 전용 메뉴 (9개 탭 명칭 직관화 및 즉시 적용 통합)
 # ----------------------------------------------------
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
@@ -324,7 +330,8 @@ def admin_menu_dialog():
         try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
-        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 엑셀 업로드", "📅 기준값 이력", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자", "🔮 AI 예측"])
+        # [수정] 탭 명칭 직관화
+        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준/이력 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자", "🔮 AI 예측"])
         
         with t1:
             st.info("오늘 생산된 배치 확인 관리")
@@ -357,15 +364,10 @@ def admin_menu_dialog():
                     row = conn.execute(f"SELECT product_name, target_value, production_date, equipment, worker, measured_value, remarks, input_amount, COALESCE({chk_c}, 0) FROM color_records WHERE id=?", (tid,)).fetchone()
                     conn.close()
                     if row:
-                        # [안전코드] 날짜 파싱 실패 방지
-                        try:
-                            def_date = datetime.strptime(row[2], "%Y-%m-%d").date()
-                        except:
-                            def_date = get_now_kst().date()
-                        
+                        try: def_date = datetime.strptime(row[2], "%Y-%m-%d").date()
+                        except: def_date = get_now_kst().date()
                         npd = st.date_input("생산일", value=def_date, key="admin_date_edit").strftime("%Y-%m-%d")
                         
-                        # [안전코드] 삭제된 제품명이 DB에 남아있을 경우 에러(ValueError) 방지
                         opts = list(TARGET_DATA.keys())
                         if row[0] not in opts: opts.append(row[0])
                         
@@ -382,9 +384,11 @@ def admin_menu_dialog():
                             stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
                             update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8])
                             st.cache_data.clear(); st.session_state['show_toast'] = "수정됨!"; st.rerun()
+        
         with t3:
-            up = st.file_uploader("과거 엑셀", type=['xlsx', 'xls'], key="admin_file_record")
-            if up and st.button("🚀 일괄 업로드", key="admin_btn_upload_record"):
+            st.info("과거 생산/측정 기록이 담긴 엑셀 데이터를 일괄 업로드합니다.")
+            up = st.file_uploader("과거 기록 엑셀 업로드", type=['xlsx', 'xls'], key="admin_file_record")
+            if up and st.button("🚀 기록 일괄 업로드", key="admin_btn_upload_record"):
                 try:
                     df_up = pd.read_excel(up)
                     if all(c in df_up.columns for c in ['생산일', '제품명', '생산설비', '작업자', '측정색도']):
@@ -395,7 +399,7 @@ def admin_menu_dialog():
                             except: continue
                             
                             p_dt = safe_date_parse(r['생산일'])
-                            if not p_dt: continue # [안전코드] 빈 줄 무시
+                            if not p_dt: continue 
                             
                             pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
                             am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "120kg" if "120" in eq else "-")
@@ -405,21 +409,34 @@ def admin_menu_dialog():
                             stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
                             conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (get_now_kst().strftime("%Y-%m-%d %H:%M:%S"), p_dt, eq, wk, pd_name, tgt, meas, diff, stat, rm if rm not in ['nan','None'] else '', am))
                         conn.commit(); conn.close()
-                        st.cache_data.clear(); st.session_state['show_toast'] = "엑셀 업로드 성공!"; st.rerun()
-                except Exception as e: st.error(e)
+                        st.cache_data.clear(); st.session_state['show_toast'] = "과거 기록 업로드 성공!"; st.rerun()
+                    else:
+                        st.error("엑셀에 필수 열('생산일', '제품명', '생산설비', '작업자', '측정색도')이 부족합니다.")
+                except Exception as e: st.error(f"오류: {e}")
+        
         with t4:
-            h_up = st.file_uploader("기준값 엑셀", type=['xlsx','xls'], key="admin_file_history")
-            if h_up and st.button("🚀 이력 반영", key="admin_btn_upload_history"):
-                df_h = pd.read_excel(h_up)
-                if all(c in df_h.columns for c in ['제품명','적용시작일','기준색도']):
-                    conn = sqlite3.connect(DB_FILE)
-                    conn.execute("DELETE FROM target_history")
-                    for _, r in df_h.iterrows():
-                        dt = safe_date_parse(r['적용시작일']) or '2000-01-01'
-                        try: conn.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (str(r['제품명']).strip(), float(r['기준색도']), dt))
-                        except: pass
-                    conn.commit(); conn.close()
-                    st.cache_data.clear(); st.session_state['show_toast'] = "세팅 완료!"; st.rerun()
+            st.info("제품별 기준 색도 엑셀 파일을 업로드하여 시스템에 즉시 적용합니다.")
+            h_up = st.file_uploader("제품 기준값/이력 엑셀 업로드", type=['xlsx','xls'], key="admin_file_history")
+            if h_up and st.button("🚀 제품 기준값 전체 적용", key="admin_btn_upload_history"):
+                try:
+                    df_h = pd.read_excel(h_up)
+                    if all(c in df_h.columns for c in ['제품명','적용시작일','기준색도']):
+                        conn = sqlite3.connect(DB_FILE)
+                        conn.execute("DELETE FROM target_history")
+                        for _, r in df_h.iterrows():
+                            dt = safe_date_parse(r['적용시작일']) or '2000-01-01'
+                            try: conn.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (str(r['제품명']).strip(), float(r['기준색도']), dt))
+                            except: pass
+                        conn.commit(); conn.close()
+                        # [핵심 픽스] 캐시를 비워 메인 화면의 제품선택 목록을 업로드한 엑셀 기반으로 즉시 업데이트
+                        st.cache_data.clear(); 
+                        st.session_state['show_toast'] = "제품 기준값이 시스템 전체에 즉시 적용되었습니다!"
+                        st.rerun()
+                    else:
+                        st.error("엑셀 파일에 '제품명', '적용시작일', '기준색도' 열이 포함되어 있어야 합니다.")
+                except Exception as e:
+                    st.error(f"적용 중 오류 발생: {e}")
+                    
         with t5:
             np_prod = st.selectbox("제품", list(TARGET_DATA.keys()), key="admin_notice_prod")
             rn = get_raw_notice(np_prod)
@@ -481,7 +498,7 @@ def admin_menu_dialog():
     elif input_pw_admin != "": st.error("❌ 비밀번호 불일치")
 
 # ----------------------------------------------------
-# 4. 메인 화면 (모든 탭 보존)
+# 4. 메인 화면 출력부
 # ----------------------------------------------------
 history_df = load_from_db()
 
@@ -496,7 +513,6 @@ with c3:
 st.markdown("---")
 st.subheader("📝 데이터 등록")
 
-# [복구 확인] 입력 2개 탭
 tab_n, tab_q = st.tabs(["📋 일반 데이터 등록", "⚡ 진행 중인 라인 빠른 추가"])
 
 with tab_n:
@@ -605,7 +621,6 @@ if not ddf.empty:
         ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
         ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
-# [복구 확인] 설비별 메트릭 요약 화면
 if not ddf.empty:
     tb = len(ddf)
     mt = "오늘" if dm=="오늘" else fd_str if dm=="특정 일자" else "전체"
@@ -631,7 +646,6 @@ def hl_eq(s):
         else: clrs.append('')
     return clrs
 
-# [최적화 유지] HTML 변환, 페이지네이션, 엑셀 분리 다운로드
 if not ddf.empty:
     page_size = 100
     total_pages = max(1, int(np.ceil(len(ddf) / page_size)))
