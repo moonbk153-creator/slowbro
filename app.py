@@ -293,7 +293,6 @@ def to_excel(df):
 init_db() 
 CURRENT_WORKERS = get_all_workers()
 
-# [핵심 픽스] TARGET_DATA를 DB에서 직접 긁어오도록 설계 변경 (즉각 동기화 지원)
 @st.cache_data
 def load_tgt():
     conn = sqlite3.connect(DB_FILE)
@@ -303,7 +302,6 @@ def load_tgt():
     if rows:
         return {r[0]: r[1] for r in rows}
     else:
-        # DB가 비어있을 경우에만 로컬 엑셀을 1회 읽어 DB에 저장
         try: 
             df = pd.read_excel(EXCEL_FILE, usecols="C:D", header=1).dropna()
             targets = {str(r.iloc[0]).strip(): float(r.iloc[1]) if not pd.isna(r.iloc[1]) else 0.0 for i, r in df.iterrows()}
@@ -320,7 +318,7 @@ today_str_kst = get_now_kst().strftime("%Y-%m-%d")
 ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 
 # ----------------------------------------------------
-# 3. 관리자 전용 메뉴 (9개 탭 명칭 직관화 및 즉시 적용 통합)
+# 3. 관리자 전용 메뉴 
 # ----------------------------------------------------
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
@@ -330,7 +328,6 @@ def admin_menu_dialog():
         try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
-        # [수정] 탭 명칭 직관화
         t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준/이력 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자", "🔮 AI 예측"])
         
         with t1:
@@ -428,7 +425,6 @@ def admin_menu_dialog():
                             try: conn.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (str(r['제품명']).strip(), float(r['기준색도']), dt))
                             except: pass
                         conn.commit(); conn.close()
-                        # [핵심 픽스] 캐시를 비워 메인 화면의 제품선택 목록을 업로드한 엑셀 기반으로 즉시 업데이트
                         st.cache_data.clear(); 
                         st.session_state['show_toast'] = "제품 기준값이 시스템 전체에 즉시 적용되었습니다!"
                         st.rerun()
@@ -531,31 +527,45 @@ with tab_n:
                 
         col_p1, col_p2 = st.columns([2, 1])
         with col_p1:
-            selected_product = st.selectbox("🔍 제품명 검색 및 선택", list(TARGET_DATA.keys()), key="main_prod")
-            if ACTIVE_NOTICES.get(selected_product): st.warning(f"📢 **전달사항:** {ACTIVE_NOTICES[selected_product]}")
+            # [핵심 픽스] 제품명 선택창에 index=None 부여 -> X 버튼 생성으로 검색어 간편 삭제 지원
+            selected_product = st.selectbox(
+                "🔍 제품명 검색 및 선택", 
+                list(TARGET_DATA.keys()), 
+                index=None, 
+                placeholder="제품명을 클릭하여 검색하세요 (우측 'X' 버튼으로 즉시 지우기)", 
+                key="main_prod"
+            )
+            
+            if selected_product and ACTIVE_NOTICES.get(selected_product): 
+                st.warning(f"📢 **전달사항:** {ACTIVE_NOTICES[selected_product]}")
+                
         with col_p2:
-            target_value = get_historical_target(selected_product, prod_date_str)
+            target_value = get_historical_target(selected_product, prod_date_str) if selected_product else 0.0
             st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
         
-        last_records = get_equipment_last_records(selected_product)
-        if last_records:
-            valid_records, very_old_records = [], []
-            today_date = get_now_kst().date()
-            for row in last_records:
-                try: days_passed = (today_date - datetime.strptime(row[1], "%Y-%m-%d").date()).days
-                except: days_passed = 0
-                if days_passed >= 365: very_old_records.append(row[0])
-                else: valid_records.append(row)
-            if very_old_records:
-                st.error(f"🚨 **[경고] 1년 이상 장기 미생산 알림!**\n\n다음 설비에서 1년 이상 생산된 적이 없습니다: **{', '.join(very_old_records)}**")
-            if valid_records:
-                st.caption("💡 **설비별 최근 생산 이력**")
-                cols = st.columns(len(valid_records[:3]))
-                for idx, row in enumerate(valid_records[:3]):
-                    disp_date = f":red[**{row[1]} (4개월 초과)**]" if (today_date - datetime.strptime(row[1], "%Y-%m-%d").date()).days > 120 else row[1]
-                    disp_meas = f":red[**{float(row[2]):.1f} (이전 불합격!)**]" if "불합격" in row[3] else f"{float(row[2]):.1f}"
-                    with cols[idx]: st.info(f"⚙️ **{row[0]}**\n\n🕒 {disp_date}\n\n📉 {disp_meas}")
-        else: st.warning("이전 생산 기록이 없습니다.")
+        # [안전코드] 제품이 선택되었을 때만 이전 기록을 조회하여 출력
+        if selected_product:
+            last_records = get_equipment_last_records(selected_product)
+            if last_records:
+                valid_records, very_old_records = [], []
+                today_date = get_now_kst().date()
+                for row in last_records:
+                    try: days_passed = (today_date - datetime.strptime(row[1], "%Y-%m-%d").date()).days
+                    except: days_passed = 0
+                    if days_passed >= 365: very_old_records.append(row[0])
+                    else: valid_records.append(row)
+                if very_old_records:
+                    st.error(f"🚨 **[경고] 1년 이상 장기 미생산 알림!**\n\n다음 설비에서 1년 이상 생산된 적이 없습니다: **{', '.join(very_old_records)}**")
+                if valid_records:
+                    st.caption("💡 **설비별 최근 생산 이력**")
+                    cols = st.columns(len(valid_records[:3]))
+                    for idx, row in enumerate(valid_records[:3]):
+                        disp_date = f":red[**{row[1]} (4개월 초과)**]" if (today_date - datetime.strptime(row[1], "%Y-%m-%d").date()).days > 120 else row[1]
+                        disp_meas = f":red[**{float(row[2]):.1f} (이전 불합격!)**]" if "불합격" in row[3] else f"{float(row[2]):.1f}"
+                        with cols[idx]: st.info(f"⚙️ **{row[0]}**\n\n🕒 {disp_date}\n\n📉 {disp_meas}")
+            else: st.warning("이전 생산 기록이 없습니다.")
+        else:
+            st.info("👆 위에서 제품을 선택하시면 과거 설비별 생산 이력이 표시됩니다.")
 
         cs8, cs9, cs10 = st.columns([2,2,1])
         with cs8: measured_value = st.number_input("측정 색도 입력", value=float(target_value), step=0.1, key="main_meas")
@@ -563,7 +573,8 @@ with tab_n:
         with cs10:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("데이터 등록하기", type="primary", use_container_width=True, key="main_btn_save"):
-                if not worker_name: st.warning("⚠️ 작업자 오류!")
+                if not selected_product: st.warning("⚠️ 제품명을 먼저 선택해주세요!")
+                elif not worker_name: st.warning("⚠️ 작업자 오류!")
                 elif check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value): st.error("⚠️ 중복 데이터!")
                 else:
                     diff = round(measured_value - target_value, 1)
