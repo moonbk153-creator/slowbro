@@ -302,8 +302,8 @@ def load_from_db():
         f_idx = df.groupby(['제품명', '생산설비']).tail(1).index
         df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
         
-        # 해당 설비의 당일 마지막 배치 (head=최신 데이터)
-        l_idx = df.groupby(['생산일', '생산설비']).head(1).index
+        # [원복 완료] 설비와 무관하게 "공장 전체 그날(당일)의 제일 마지막 단일 배치"에만 표시
+        l_idx = df.groupby('생산일').head(1).index
         df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
         
         df['특이사항'] = df['특이사항'].str.strip()
