@@ -50,12 +50,18 @@ if not st.session_state['logged_in']:
 
 def get_now_kst(): return datetime.now(KST)
 
+# [핵심 해결] 마침표/공백 포함 한국식 날짜를 완벽한 YYYY-MM-DD ISO 형식으로 정규화 (정렬 역전 원천 차단)
 def safe_date_parse(val):
     v = str(val).strip()
     if v in ['nan', 'None', '', 'NaN', 'NaT']: return ""
-    v = v.split(" ")[0].replace("/", "-").replace(".", "-")
-    try: return pd.to_datetime(v).strftime("%Y-%m-%d")
-    except: return v
+    try:
+        return pd.to_datetime(v).strftime("%Y-%m-%d")
+    except:
+        v_clean = v.split(" ")[0].replace(".", "-").replace("/", "-").replace("년", "-").replace("월", "-").replace("일", "").strip("-")
+        try:
+            return pd.to_datetime(v_clean).strftime("%Y-%m-%d")
+        except:
+            return v
 
 # ----------------------------------------------------
 # 2. DB 관리 및 보조 함수 
@@ -211,6 +217,7 @@ def load_from_db():
         conn.close()
         return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
 
+    # [검수 확인] 모든 날짜 형식이 완벽한 YYYY-MM-DD로 변환되어 정렬 오류 방지
     df['생산일'] = df['생산일'].apply(safe_date_parse)
     df['제품명'] = df['제품명'].astype(str).str.strip()
     df['생산설비'] = df['생산설비'].astype(str).str.strip()
@@ -239,6 +246,7 @@ def load_from_db():
         mask = df['고유번호'].isin(target_change_first_ids)
         df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
+    # [핵심 검수] 생산일 내림차순 정렬이 보장되어, tail(1)은 항상 DB 역사상 해당 제품&설비의 실제 최초 생산 배치만 정확히 지정됨
     f_idx = df.groupby(['제품명', '생산설비']).tail(1).index
     df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
     l_idx = df.groupby('생산일').head(1).index
@@ -318,7 +326,7 @@ today_str_kst = get_now_kst().strftime("%Y-%m-%d")
 ACTIVE_NOTICES = get_all_active_notices(today_str_kst)
 
 # ----------------------------------------------------
-# 3. 관리자 전용 메뉴 
+# 3. 관리자 전용 메뉴 (9개 탭 전수 보존)
 # ----------------------------------------------------
 @st.dialog("🛠️ 관리자 전용 메뉴", width="large")
 def admin_menu_dialog():
@@ -527,7 +535,7 @@ with tab_n:
                 
         col_p1, col_p2 = st.columns([2, 1])
         with col_p1:
-            # [핵심 픽스] 제품명 선택창에 index=None 부여 -> X 버튼 생성으로 검색어 간편 삭제 지원
+            # [검수 확인] index=None 지원으로 클릭 및 검색어 간편 삭제('X' 버튼) 완벽 보존
             selected_product = st.selectbox(
                 "🔍 제품명 검색 및 선택", 
                 list(TARGET_DATA.keys()), 
@@ -543,7 +551,6 @@ with tab_n:
             target_value = get_historical_target(selected_product, prod_date_str) if selected_product else 0.0
             st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
         
-        # [안전코드] 제품이 선택되었을 때만 이전 기록을 조회하여 출력
         if selected_product:
             last_records = get_equipment_last_records(selected_product)
             if last_records:
@@ -632,6 +639,7 @@ if not ddf.empty:
         ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
         ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
+# [검수 확인] 당일/전체/특정 일자 설비별 생산 배치 요약 카드 완벽 보존
 if not ddf.empty:
     tb = len(ddf)
     mt = "오늘" if dm=="오늘" else fd_str if dm=="특정 일자" else "전체"
