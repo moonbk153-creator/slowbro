@@ -278,13 +278,14 @@ def load_from_db():
         df.loc[df['오차'].abs() > 2.0, '판정'] = "불합격 🔴"
         df.loc[df['오차'].isna(), '판정'] = "오류"
         
+        # 가짜 태그 흔적 텍스트 완벽 정화(정규식)
         df['특이사항'] = df['특이사항'].fillna('').astype(str)
         df['특이사항'] = df['특이사항'].str.replace(r'\[설비 첫\s*배치\s*🚀\]\s*', '', regex=True)
         df['특이사항'] = df['특이사항'].str.replace(r'\[마지막 배치\s*🏁\]\s*', '', regex=True)
         df['특이사항'] = df['특이사항'].str.replace(r'\[기준값 변경 후 첫 생산\s*🔔\]\s*', '', regex=True)
         df['특이사항'] = df['특이사항'].str.replace("nan", "", regex=False).str.strip()
 
-        # 태그 부착을 위한 내부 로직용 정렬 (시간 역순)
+        # 내부 연산용 시간 역순 정렬 (최신이 상단, 과거가 하단)
         df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
 
         th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn)
@@ -297,9 +298,11 @@ def load_from_db():
             mask = df['고유번호'].isin(target_change_first_ids)
             df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
-        f_idx = df.groupby(['생산일', '생산설비']).tail(1).index
+        # [원복 완료] 해당 제품을 해당 설비에서 역사상 처음 볶았을 때 (tail=과거 데이터)
+        f_idx = df.groupby(['제품명', '생산설비']).tail(1).index
         df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
         
+        # 해당 설비의 당일 마지막 배치 (head=최신 데이터)
         l_idx = df.groupby(['생산일', '생산설비']).head(1).index
         df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
         
@@ -477,9 +480,6 @@ def admin_menu_dialog():
                         st.error("엑셀에 필수 열('생산일', '제품명', '생산설비', '작업자', '측정색도')이 부족합니다.")
                 except Exception as e: st.error(f"오류: {e}")
             
-            # =========================================================
-            # [핵심 추가] DB 고유번호 꼬임 영구 해결 및 자동 재정렬 기능
-            # =========================================================
             st.markdown("---")
             st.error("🛠️ **DB 고유번호 꼬임 해결 (초기화 및 재정렬)**")
             st.caption("과거 데이터를 나중에 업로드하여 고유번호(순서)가 날짜와 맞지 않게 꼬였을 때, 아래 버튼을 누르면 생산일자 순으로 고유번호를 1번부터 깔끔하게 재정렬합니다.")
@@ -490,7 +490,6 @@ def admin_menu_dialog():
                     if not df_all.empty:
                         # 생산일(과거순) -> 당일 기존 고유번호(생산순) 정렬
                         df_all = df_all.sort_values(by=['production_date', 'id'], ascending=[True, True]).reset_index(drop=True)
-                        # 고유번호 1부터 순서대로 새로 발급
                         df_all['id'] = df_all.index + 1
                         
                         conn.execute("DROP TABLE color_records")
@@ -509,7 +508,6 @@ def admin_menu_dialog():
                     st.error(f"재정렬 중 오류 발생: {e}")
                 finally:
                     conn.close()
-            # =========================================================
         
         with t4:
             st.info("제품별 기준 색도 엑셀 파일을 업로드하여 시스템에 즉시 적용합니다.")
@@ -728,7 +726,6 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
-        # [정렬 정상화] 설비 묶음(버닝->태환...) + 시간 역순(최신 생산일 먼저) + 번호 정순
         eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
         ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
         
