@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import io 
 import pytz
 import numpy as np
-import re
 
 # [최적화] 공휴일 로드 및 오류 방지
 try:
@@ -226,14 +225,15 @@ def load_from_db():
     df.loc[df['오차'].abs() > 2.0, '판정'] = "불합격 🔴"
     df.loc[df['오차'].isna(), '판정'] = "오류"
     
-    # [핵심 방어 코드] DB에 영구 저장된 오타 섞인 가짜 태그들을 정규식(Regex)으로 흔적도 없이 소각합니다.
+    # DB에 박혀버린 가짜 태그 흔적 텍스트 완벽 정화(정규식)
     df['특이사항'] = df['특이사항'].fillna('').astype(str)
+    import re
     df['특이사항'] = df['특이사항'].str.replace(r'\[설비 첫\s*배치\s*🚀\]\s*', '', regex=True)
     df['특이사항'] = df['특이사항'].str.replace(r'\[마지막 배치\s*🏁\]\s*', '', regex=True)
     df['특이사항'] = df['특이사항'].str.replace(r'\[기준값 변경 후 첫 생산\s*🔔\]\s*', '', regex=True)
     df['특이사항'] = df['특이사항'].str.replace("nan", "", regex=False).str.strip()
 
-    # 시간을 기준으로 최신순 정렬 (ID가 클수록 나중에 입력됨)
+    # 시간 역순(최신순) 정렬 
     df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
 
     th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn)
@@ -246,11 +246,11 @@ def load_from_db():
         mask = df['고유번호'].isin(target_change_first_ids)
         df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
-    # [핵심 로직] 오직 당일(생산일)과 생산설비를 기준으로 '진짜 첫 배치'와 '진짜 마지막 배치'를 찾아냅니다.
-    f_idx = df.groupby(['생산일', '생산설비']).tail(1).index
+    # [수정 완료] 사용자님 원래 비즈니스 로직(해당 설비에서 해당 제품을 역사상 처음 볶았을 때)으로 롤백!
+    f_idx = df.groupby(['제품명', '생산설비']).tail(1).index
     df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
     
-    l_idx = df.groupby(['생산일', '생산설비']).head(1).index
+    l_idx = df.groupby('생산일').head(1).index
     df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
     
     conn.close()
@@ -632,12 +632,8 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
-        eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
-        ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
-        
-        ddf['prod_first_id'] = ddf.groupby(['s', '제품명'])['고유번호'].transform('min')
-        ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
-        ddf = ddf.drop(columns=['s', 'prod_first_id'])
+        # [복구 완료] 오직 시간 역순(최신순) 정렬만 100% 정상 적용 (사용자 혼동 유발 정렬 로직 영구 삭제)
+        ddf = ddf.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False])
 
 if not ddf.empty:
     tb = len(ddf)
