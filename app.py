@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import io 
 import pytz
 import numpy as np
+import re
 
 # [최적화] 공휴일 로드 및 오류 방지
 try:
@@ -224,10 +225,16 @@ def load_from_db():
     df['판정'] = "합격 🟢"
     df.loc[df['오차'].abs() > 2.0, '판정'] = "불합격 🔴"
     df.loc[df['오차'].isna(), '판정'] = "오류"
-    df['특이사항'] = df['특이사항'].fillna('')
+    
+    # [핵심 방어 코드] DB에 영구 저장된 오타 섞인 가짜 태그들을 정규식(Regex)으로 흔적도 없이 소각합니다.
+    df['특이사항'] = df['특이사항'].fillna('').astype(str)
+    df['특이사항'] = df['특이사항'].str.replace(r'\[설비 첫\s*배치\s*🚀\]\s*', '', regex=True)
+    df['특이사항'] = df['특이사항'].str.replace(r'\[마지막 배치\s*🏁\]\s*', '', regex=True)
+    df['특이사항'] = df['특이사항'].str.replace(r'\[기준값 변경 후 첫 생산\s*🔔\]\s*', '', regex=True)
+    df['특이사항'] = df['특이사항'].str.replace("nan", "", regex=False).str.strip()
 
+    # 시간을 기준으로 최신순 정렬 (ID가 클수록 나중에 입력됨)
     df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
-    df['특이사항'] = df['특이사항'].astype(str).str.replace("[마지막 배치 🏁]", "", regex=False).str.replace("[설비 첫 배치 🚀]", "", regex=False).str.replace("[기준값 변경 후 첫 생산 🔔]", "", regex=False).str.strip()
 
     th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn)
     target_change_first_ids = set()
@@ -239,7 +246,7 @@ def load_from_db():
         mask = df['고유번호'].isin(target_change_first_ids)
         df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
-    # [핵심 버그 수정 완료] 제품명(x) -> 오직 생산일과 설비만을 기준으로 당일 진짜 첫 배치 탐색
+    # [핵심 로직] 오직 당일(생산일)과 생산설비를 기준으로 '진짜 첫 배치'와 '진짜 마지막 배치'를 찾아냅니다.
     f_idx = df.groupby(['생산일', '생산설비']).tail(1).index
     df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
     
