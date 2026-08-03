@@ -59,13 +59,12 @@ def safe_date_parse(val):
     except: return v
 
 # ----------------------------------------------------
-# 2. DB 관리 및 보조 함수 (Lock 완벽 방지 적용)
+# 2. DB 관리 및 보조 함수 (Lock 방지 유지)
 # ----------------------------------------------------
 def get_db_conn():
-    """모든 DB 충돌을 방지하는 중앙 집중식 연결 함수 (WAL 모드 & Timeout 적용)"""
     conn = sqlite3.connect(DB_FILE, timeout=20.0, check_same_thread=False)
     try:
-        conn.execute("PRAGMA journal_mode=WAL;") # 동시 읽기/쓰기 허용 모드
+        conn.execute("PRAGMA journal_mode=WAL;")
     except:
         pass
     return conn
@@ -279,14 +278,13 @@ def load_from_db():
         df.loc[df['오차'].abs() > 2.0, '판정'] = "불합격 🔴"
         df.loc[df['오차'].isna(), '판정'] = "오류"
         
-        # DB에 박혀버린 가짜 태그 흔적 텍스트 완벽 정화(정규식)
         df['특이사항'] = df['특이사항'].fillna('').astype(str)
         df['특이사항'] = df['특이사항'].str.replace(r'\[설비 첫\s*배치\s*🚀\]\s*', '', regex=True)
         df['특이사항'] = df['특이사항'].str.replace(r'\[마지막 배치\s*🏁\]\s*', '', regex=True)
         df['특이사항'] = df['특이사항'].str.replace(r'\[기준값 변경 후 첫 생산\s*🔔\]\s*', '', regex=True)
         df['특이사항'] = df['특이사항'].str.replace("nan", "", regex=False).str.strip()
 
-        # 시간 역순(최신순) 정렬 
+        # 내부 연산용 시간 역순 정렬 (태그 부착을 위함)
         df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
 
         th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn)
@@ -299,7 +297,6 @@ def load_from_db():
             mask = df['고유번호'].isin(target_change_first_ids)
             df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
-        # 오직 당일(생산일)과 생산설비를 기준으로 '진짜 첫 배치'와 '진짜 마지막 배치' 찾아내기
         f_idx = df.groupby(['생산일', '생산설비']).tail(1).index
         df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
         
@@ -697,13 +694,13 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
-        # [설비별 정렬 완벽 복구] 버닝 -> 태환 -> 프로밧 -> 뷸러60 -> 뷸러120 순서로 정렬
+        # [수정] 엉뚱하게 묶이던 제품명 그룹화 로직 완전 폐기
+        # 올바른 정렬 논리: 1순위(설비순), 2순위(최신 날짜순), 3순위(당일 내 실제 생산순서=고유번호 정순)
         eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
         ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
         
-        ddf['prod_first_id'] = ddf.groupby(['s', '제품명'])['고유번호'].transform('min')
-        ddf = ddf.sort_values(by=['s', 'prod_first_id', '고유번호'], ascending=[True, True, True])
-        ddf = ddf.drop(columns=['s', 'prod_first_id'])
+        ddf = ddf.sort_values(by=['s', '생산일', '고유번호'], ascending=[True, False, True])
+        ddf = ddf.drop(columns=['s'])
 
 if not ddf.empty:
     tb = len(ddf)
