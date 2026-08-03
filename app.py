@@ -59,7 +59,7 @@ def safe_date_parse(val):
     except: return v
 
 # ----------------------------------------------------
-# 2. DB 관리 및 보조 함수 (Lock 방지 유지)
+# 2. DB 관리 및 보조 함수 
 # ----------------------------------------------------
 def get_db_conn():
     conn = sqlite3.connect(DB_FILE, timeout=20.0, check_same_thread=False)
@@ -284,7 +284,7 @@ def load_from_db():
         df['특이사항'] = df['특이사항'].str.replace(r'\[기준값 변경 후 첫 생산\s*🔔\]\s*', '', regex=True)
         df['특이사항'] = df['특이사항'].str.replace("nan", "", regex=False).str.strip()
 
-        # 내부 연산용 시간 역순 정렬 (태그 부착을 위함)
+        # 태그 부착을 위한 내부 로직용 정렬 (시간 역순)
         df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
 
         th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn)
@@ -476,6 +476,40 @@ def admin_menu_dialog():
                     else:
                         st.error("엑셀에 필수 열('생산일', '제품명', '생산설비', '작업자', '측정색도')이 부족합니다.")
                 except Exception as e: st.error(f"오류: {e}")
+            
+            # =========================================================
+            # [핵심 추가] DB 고유번호 꼬임 영구 해결 및 자동 재정렬 기능
+            # =========================================================
+            st.markdown("---")
+            st.error("🛠️ **DB 고유번호 꼬임 해결 (초기화 및 재정렬)**")
+            st.caption("과거 데이터를 나중에 업로드하여 고유번호(순서)가 날짜와 맞지 않게 꼬였을 때, 아래 버튼을 누르면 생산일자 순으로 고유번호를 1번부터 깔끔하게 재정렬합니다.")
+            if st.button("🧹 고유번호 날짜순 전면 재정렬", type="primary", key="admin_btn_reindex"):
+                conn = get_db_conn()
+                try:
+                    df_all = pd.read_sql_query("SELECT * FROM color_records", conn)
+                    if not df_all.empty:
+                        # 생산일(과거순) -> 당일 기존 고유번호(생산순) 정렬
+                        df_all = df_all.sort_values(by=['production_date', 'id'], ascending=[True, True]).reset_index(drop=True)
+                        # 고유번호 1부터 순서대로 새로 발급
+                        df_all['id'] = df_all.index + 1
+                        
+                        conn.execute("DROP TABLE color_records")
+                        conn.execute('''CREATE TABLE color_records (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, production_date TEXT, equipment TEXT, worker TEXT, product_name TEXT, target_value REAL, measured_value REAL, difference REAL, status TEXT, remarks TEXT DEFAULT '', input_amount TEXT DEFAULT '-', checked INTEGER DEFAULT 0)''')
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
+                        
+                        df_all.to_sql('color_records', conn, if_exists='append', index=False)
+                        conn.commit()
+                        
+                        st.cache_data.clear()
+                        st.session_state['show_toast'] = "고유번호 전면 재정렬 완료! 순서가 정상화되었습니다."
+                        st.rerun()
+                    else:
+                        st.info("데이터가 없습니다.")
+                except Exception as e:
+                    st.error(f"재정렬 중 오류 발생: {e}")
+                finally:
+                    conn.close()
+            # =========================================================
         
         with t4:
             st.info("제품별 기준 색도 엑셀 파일을 업로드하여 시스템에 즉시 적용합니다.")
@@ -694,8 +728,7 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
-        # [수정] 엉뚱하게 묶이던 제품명 그룹화 로직 완전 폐기
-        # 올바른 정렬 논리: 1순위(설비순), 2순위(최신 날짜순), 3순위(당일 내 실제 생산순서=고유번호 정순)
+        # [정렬 정상화] 설비 묶음(버닝->태환...) + 시간 역순(최신 생산일 먼저) + 번호 정순
         eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
         ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
         
