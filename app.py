@@ -247,9 +247,10 @@ def load_from_db():
         df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
     # [핵심 검수] 생산일 내림차순 정렬이 보장되어, tail(1)은 항상 DB 역사상 해당 제품&설비의 실제 최초 생산 배치만 정확히 지정됨
-    f_idx = df.groupby(['제품명', '생산설비']).tail(1).index
+    f_idx = df.groupby(['생산일', '생산설비']).tail(1).index
     df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
-    l_idx = df.groupby('생산일').head(1).index
+    
+    l_idx = df.groupby(['생산일', '생산설비']).head(1).index
     df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
     conn.close()
     
