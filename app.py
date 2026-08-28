@@ -298,11 +298,18 @@ def load_from_db():
             mask = df['고유번호'].isin(target_change_first_ids)
             df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
-        # [원복 완료] 해당 제품을 해당 설비에서 역사상 처음 볶았을 때 (tail=과거 데이터)
-        f_idx = df.groupby(['제품명', '생산설비']).tail(1).index
+        # =========================================================================
+        # [핵심 로직] 제품/설비명의 띄어쓰기를 임시로 모두 무시하고(통일화) 진짜 첫 배치를 찾습니다.
+        df['norm_p'] = df['제품명'].str.replace(" ", "").str.lower()
+        df['norm_e'] = df['생산설비'].str.replace(" ", "").str.lower()
+        
+        f_idx = df.groupby(['norm_p', 'norm_e']).tail(1).index
         df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
         
-        # [원복 완료] 설비와 무관하게 "공장 전체 그날(당일)의 제일 마지막 단일 배치"에만 표시
+        df = df.drop(columns=['norm_p', 'norm_e'])
+        # =========================================================================
+        
+        # 설비와 무관하게 "공장 전체 그날(당일)의 제일 마지막 단일 배치"에만 표시
         l_idx = df.groupby('생산일').head(1).index
         df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
         
@@ -391,7 +398,7 @@ def admin_menu_dialog():
         try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
-        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준/이력 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 작업자", "🔮 AI 예측"])
+        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준/이력 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 데이터 정화", "🔮 AI 예측"])
         
         with t1:
             st.info("오늘 생산된 배치 확인 관리")
@@ -567,19 +574,37 @@ def admin_menu_dialog():
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 st.dataframe(pd.DataFrame(ws).sort_values(by="총", ascending=False).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
         with t8:
-            nw = st.text_input("새 작업자 이름", key="admin_new_worker")
-            if st.button("➕ 작업자 추가", type="primary", key="admin_btn_add_worker") and add_worker(nw): st.cache_data.clear(); st.session_state['show_toast'] = "작업자 추가!"; st.rerun()
-            if CURRENT_WORKERS:
-                dw = st.selectbox("기존 작업자", CURRENT_WORKERS, key="admin_del_worker_sel")
-                if st.button("➖ 작업자 삭제", key="admin_btn_del_worker"): delete_worker(dw); st.cache_data.clear(); st.session_state['show_toast'] = "작업자 삭제!"; st.rerun()
-            if st.button("🧹 DB 텍스트 공백 정화", key="admin_btn_clean_db"):
+            st.info("작업자 명단 추가/삭제 및 과거 엑셀 데이터 명칭 강제 통일화 도구입니다.")
+            c_w1, c_w2 = st.columns(2)
+            with c_w1:
+                nw = st.text_input("새 작업자 이름", key="admin_new_worker")
+                if st.button("➕ 작업자 추가", type="primary", key="admin_btn_add_worker") and add_worker(nw): st.cache_data.clear(); st.session_state['show_toast'] = "작업자 추가!"; st.rerun()
+            with c_w2:
+                if CURRENT_WORKERS:
+                    dw = st.selectbox("기존 작업자", CURRENT_WORKERS, key="admin_del_worker_sel")
+                    if st.button("➖ 작업자 삭제", key="admin_btn_del_worker"): delete_worker(dw); st.cache_data.clear(); st.session_state['show_toast'] = "작업자 삭제!"; st.rerun()
+            
+            st.markdown("---")
+            st.error("🛠️ **DB 명칭 불일치 해결 (과거 데이터 통합)**")
+            st.caption("과거 엑셀로 업로드한 기록의 설비명이나 제품명에 미세한 오타/띄어쓰기가 있어 같은 제품으로 인식되지 않을 때, 시스템 기준으로 강제 통일시킵니다.")
+            if st.button("✨ 데이터 명칭 전면 통일화 (첫 배치 오류 완전 해결)", type="primary", use_container_width=True, key="admin_btn_clean_db"):
                 conn = get_db_conn()
                 try:
-                    conn.execute("UPDATE color_records SET worker = TRIM(worker), equipment = TRIM(equipment), product_name = TRIM(product_name)")
+                    # 1. 띄어쓰기 및 양옆 공백 제거 업데이트 (제품명, 작업자)
+                    conn.execute("UPDATE color_records SET worker = TRIM(worker), product_name = TRIM(product_name)")
+                    
+                    # 2. 설비명 강제 통일 (엑셀에서 '태환12kg', '태환 12kg ' 등으로 적힌 것을 모두 시스템명으로 강제 덮어쓰기)
+                    conn.execute("UPDATE color_records SET equipment = '버닝' WHERE REPLACE(equipment, ' ', '') LIKE '%버닝%'")
+                    conn.execute("UPDATE color_records SET equipment = '태환 12kg' WHERE REPLACE(equipment, ' ', '') LIKE '%태환%'")
+                    conn.execute("UPDATE color_records SET equipment = '프로밧 25kg' WHERE REPLACE(equipment, ' ', '') LIKE '%프로밧%'")
+                    conn.execute("UPDATE color_records SET equipment = '뷸러 60kg' WHERE REPLACE(equipment, ' ', '') LIKE '%60%'")
+                    conn.execute("UPDATE color_records SET equipment = '뷸러 120kg' WHERE REPLACE(equipment, ' ', '') LIKE '%120%'")
+                    
                     conn.commit()
                 finally:
                     conn.close()
-                st.cache_data.clear(); st.session_state['show_toast'] = "DB 정화 완료!"; st.rerun()
+                st.cache_data.clear(); st.session_state['show_toast'] = "데이터 명칭 100% 통일화 완료!"; st.rerun()
+                
         with t9:
             st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
             pred_data = get_ai_predictions()
