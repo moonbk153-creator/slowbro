@@ -5,7 +5,48 @@ import io
 import pytz
 import numpy as np
 import re
-from sqlalchemy import create_engine, text
+
+st.set_page_config(page_title="색도 관리 시스템", layout="wide")
+
+# =====================================================================
+# 🚨 1. 패키지 설치 확인 (빨간색 에러창 원천 차단 무적 방어막)
+# =====================================================================
+try:
+    from sqlalchemy import create_engine, text
+except ImportError:
+    st.error("🚨 **[필수 부품 설치 안내] 클라우드 DB 연동 패키지가 없습니다!**")
+    st.warning("현재 깃허브 서버에 Supabase 통신용 부품이 없어 실행이 중단되었습니다. 아래 3단계를 따라해주세요.")
+    st.markdown('''
+    1. **GitHub(깃허브)** 의 `slowbro` 저장소로 이동합니다.
+    2. **`requirements.txt`** 라는 이름의 파일을 새로 만들거나 엽니다. (이미 있다면 수정 버튼 클릭)
+    3. 파일 내용에 아래 두 줄을 복사해서 붙여넣고 저장(**Commit**)해 주세요.
+    ''')
+    st.code("SQLAlchemy==2.0.25\npsycopg2-binary==2.9.9", language="text")
+    st.success("저장 후 약 1~2분 뒤에 서버가 알아서 재부팅되며 시스템이 100% 정상 작동합니다!")
+    st.stop()
+
+# =====================================================================
+# 🚨 2. Secrets 환경변수 확인 (보안 설정 에러 원천 차단)
+# =====================================================================
+try:
+    ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
+    ACCESS_PASSWORD = st.secrets["APP_PASSWORD"]
+    DB_URL_RAW = st.secrets["DB_URL"]
+except KeyError as e:
+    st.error(f"🚨 **[보안 설정 안내] 설정값이 누락되었습니다: {e}**")
+    st.info("Streamlit Cloud 설정창에서 비밀번호 및 DB 주소를 입력해야 합니다.")
+    st.markdown('''
+    1. 화면 우측 하단의 **Manage app** 을 누릅니다. (또는 앱 대시보드로 이동)
+    2. 세 점(⋮) 메뉴를 누르고 **Settings -> Secrets** 로 들어갑니다.
+    3. 아래 내용을 본인의 환경에 맞게 입력하고 **Save** 해주세요.
+    ''')
+    st.code('''
+APP_PASSWORD = "기존사내비밀번호"
+ADMIN_PASSWORD = "기존관리자비밀번호"
+DB_URL = "postgresql://postgres:비밀번호@...supabase.co:5432/postgres"
+    ''', language="toml")
+    st.stop()
+
 
 # [최적화] 공휴일 로드 및 오류 방지
 try:
@@ -21,7 +62,6 @@ try: from streamlit_autorefresh import st_autorefresh
 except ImportError: st_autorefresh = None
 
 KST = pytz.timezone('Asia/Seoul')
-st.set_page_config(page_title="색도 관리 시스템", layout="wide")
 
 if 'show_toast' in st.session_state:
     st.toast(st.session_state['show_toast'], icon="✅")
@@ -29,7 +69,6 @@ if 'show_toast' in st.session_state:
 
 EXCEL_FILE = 'data sheet.xlsx'
 EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
-ADMIN_PASSWORD, ACCESS_PASSWORD = st.secrets["ADMIN_PASSWORD"], st.secrets["APP_PASSWORD"]
 
 # ----------------------------------------------------
 # 1. 인증 및 기본 설정
@@ -167,7 +206,8 @@ def auto_fill_input_amount(row):
         if "태환" in eq: return "12kg"
         elif "프로밧" in eq: return "25kg"
         elif "60" in eq: return "60kg"
-        elif "120" in eq: return "125kg" # [수정] 뷸러120kg -> 125kg 적용
+        # 뷸러 120kg의 기본 투입량을 125kg으로 일괄 적용
+        elif "120" in eq: return "125kg"
     return amt
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -283,6 +323,7 @@ def to_excel(df):
     with pd.ExcelWriter(output, engine='openpyxl') as w: df.to_excel(w, index=False, sheet_name='기록')
     return output.getvalue()
 
+# 초기 세팅 실행
 init_db() 
 CURRENT_WORKERS = get_all_workers()
 
@@ -351,10 +392,7 @@ def admin_menu_dialog():
                         
                         nprod = st.selectbox("제품", opts, index=opts.index(row[0]), key="admin_sel_prod")
                         neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0, key="admin_sel_equip")
-                        
-                        # [수정] 수정 모드에서도 120kg은 125kg으로 표시
                         namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "125kg" if "120" in neq else "-")
-                        
                         nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
                         nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
                         nrm = st.text_input("특이사항", value=row[6], key="admin_txt_rmk")
@@ -382,10 +420,7 @@ def admin_menu_dialog():
                             if not p_dt: continue 
                             
                             pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
-                            
-                            # [수정] 과거 엑셀 업로드 시에도 120이면 무조건 125kg으로 기록
                             am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "120" in eq else "-")
-                            
                             rm = str(r.get('특이사항', '')).strip()
                             tgt = get_historical_target(pd_name, p_dt)
                             diff = round(meas - tgt, 1)
@@ -472,7 +507,7 @@ def admin_menu_dialog():
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 st.dataframe(pd.DataFrame(ws).sort_values(by="총", ascending=False).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
         with t8:
-            st.info("작업자 명단 관리 및 과거 엑셀 데이터 명칭 강제 통일화 도구입니다.")
+            st.info("작업자 관리 및 DB 일괄 정화 도구입니다.")
             c_w1, c_w2 = st.columns(2)
             with c_w1:
                 nw = st.text_input("새 작업자 이름", key="admin_new_worker")
@@ -494,17 +529,15 @@ def admin_menu_dialog():
                 db_execute("UPDATE color_records SET equipment = '뷸러 120kg' WHERE REPLACE(equipment, ' ', '') LIKE :v", {"v": "%120%"})
                 st.cache_data.clear(); st.session_state['show_toast'] = "데이터 명칭 100% 통일화 완료!"; st.rerun()
                 
-            # =========================================================
-            # [핵심 추가] 뷸러 120kg 과거 기록 투입량 일괄 수정 버튼
-            # =========================================================
             st.markdown("---")
-            st.error("🛠️ **투입량 일괄 수정 (뷸러 120kg -> 125kg)**")
-            st.caption("과거 기록 중 뷸러 120kg 설비의 투입량을 기존 120kg에서 실제 투입량인 125kg으로 일괄 변경합니다.")
-            if st.button("✨ 뷸러 120kg 투입량 '125kg'으로 일괄 수정", type="primary", use_container_width=True, key="admin_btn_fix_125"):
-                db_execute("UPDATE color_records SET input_amount = '125kg' WHERE equipment LIKE :v", {"v": "%120%"})
-                st.cache_data.clear(); st.session_state['show_toast'] = "투입량 125kg 일괄 수정 완료!"; st.rerun()
-            # =========================================================
-
+            st.error("🛠️ **뷸러 120kg 투입량 일괄 수정 (120kg → 125kg)**")
+            st.caption("과거에 '120kg'으로 잘못 기록된 뷸러 120kg 설비의 투입량을 실제에 맞게 '125kg'으로 일괄 변경합니다.")
+            if st.button("🚀 뷸러 120kg 투입량 125kg으로 일괄 변경", type="primary", use_container_width=True, key="admin_btn_update_125"):
+                db_execute("UPDATE color_records SET input_amount = '125kg' WHERE equipment LIKE '%120%' AND input_amount = '120kg'")
+                st.cache_data.clear()
+                st.session_state['show_toast'] = "125kg 일괄 변경 완료!"
+                st.rerun()
+                
         with t9:
             st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
             pred_data = get_ai_predictions()
@@ -551,7 +584,6 @@ with tab_n:
         with cs4:
             if "버닝" in equip_clean: input_amount_val = st.selectbox("원료 투입량", ["1.35kg", "2.5kg", "3.75kg"], key="main_amt_sel")
             else:
-                # [수정] 뷸러 120kg 선택 시 투입량을 125kg으로 자동 고정
                 input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "125kg" if "120" in equip_clean else "-"
                 st.text_input("투입량 (고정)", input_amount_val, disabled=True, key="main_amt_txt")
                 
@@ -561,7 +593,7 @@ with tab_n:
                 "🔍 제품명 검색 및 선택", 
                 list(TARGET_DATA.keys()), 
                 index=None, 
-                placeholder="제품명을 클릭하여 검색하세요 (우측 'X' 버튼으로 즉시 지 지우기)", 
+                placeholder="제품명을 클릭하여 검색하세요 (우측 'X' 버튼으로 즉시 지우기)", 
                 key="main_prod"
             )
             if selected_product and ACTIVE_NOTICES.get(selected_product): 
