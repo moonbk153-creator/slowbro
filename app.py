@@ -237,7 +237,7 @@ def auto_fill_input_amount(row):
         if "태환" in eq: return "12kg"
         elif "프로밧" in eq: return "25kg"
         elif "60" in eq: return "60kg"
-        elif "120" in eq: return "120kg"
+        elif "120" in eq: return "125kg"
     return amt
 
 @st.cache_data(show_spinner=False, ttl=600)
