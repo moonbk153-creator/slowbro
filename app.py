@@ -63,6 +63,7 @@ def safe_date_parse(val):
 # ----------------------------------------------------
 @st.cache_resource
 def get_engine():
+    # pool_pre_ping=True 로 DB 연결 끊김 현상(Zombie connection) 완벽 방지
     db_url = st.secrets["DB_URL"].replace("postgres://", "postgresql://")
     return create_engine(db_url, pool_pre_ping=True)
 
@@ -82,6 +83,7 @@ def db_fetchone(query, params={}):
         return tuple(r) if r else None
 
 def init_db():
+    # PostgreSQL 용 테이블 생성 쿼리 (AUTOINCREMENT -> SERIAL)
     db_execute('''CREATE TABLE IF NOT EXISTS color_records (id SERIAL PRIMARY KEY, timestamp TEXT, production_date TEXT, equipment TEXT, worker TEXT, product_name TEXT, target_value REAL, measured_value REAL, difference REAL, status TEXT, remarks TEXT DEFAULT '', input_amount TEXT DEFAULT '-', checked INTEGER DEFAULT 0)''')
     db_execute('''CREATE TABLE IF NOT EXISTS target_history (id SERIAL PRIMARY KEY, product_name TEXT, target_value REAL, effective_date TEXT)''')
     db_execute('''CREATE TABLE IF NOT EXISTS product_notices (product_name TEXT PRIMARY KEY, notice_text TEXT, start_date TEXT, end_date TEXT)''')
@@ -123,6 +125,7 @@ def get_historical_target(p_name, d_str):
     return r[0] if r else TARGET_DATA.get(p_name, 0.0)
 
 def save_notice(p, txt, s_date, e_date):
+    # PostgreSQL 용 ON CONFLICT 업데이트문
     db_execute('''INSERT INTO product_notices (product_name, notice_text, start_date, end_date) VALUES (:p, :txt, :sd, :ed) ON CONFLICT (product_name) DO UPDATE SET notice_text=EXCLUDED.notice_text, start_date=EXCLUDED.start_date, end_date=EXCLUDED.end_date''', {"p":p, "txt":txt, "sd":s_date, "ed":e_date})
 
 def delete_notice(p):
@@ -167,7 +170,8 @@ def auto_fill_input_amount(row):
         if "태환" in eq: return "12kg"
         elif "프로밧" in eq: return "25kg"
         elif "60" in eq: return "60kg"
-        elif "120" in eq: return "125kg" # [수정] 뷸러120kg -> 125kg 적용
+        # 뷸러 120kg의 기본 투입량을 125kg으로 일괄 적용
+        elif "120" in eq: return "125kg"
     return amt
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -186,6 +190,7 @@ def load_from_db():
     FROM color_records c
     """
     try: 
+        # SQLAlchemy 엔진을 통해 Pandas로 즉시 로드
         df = pd.read_sql_query(text(q), get_engine())
     except Exception: 
         return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
@@ -207,12 +212,14 @@ def load_from_db():
     df.loc[df['오차'].abs() > 2.0, '판정'] = "불합격 🔴"
     df.loc[df['오차'].isna(), '판정'] = "오류"
     
+    # 가짜 태그 흔적 텍스트 완벽 정화(정규식)
     df['특이사항'] = df['특이사항'].fillna('').astype(str)
     df['특이사항'] = df['특이사항'].str.replace(r'\[설비 첫\s*배치\s*🚀\]\s*', '', regex=True)
     df['특이사항'] = df['특이사항'].str.replace(r'\[마지막 배치\s*🏁\]\s*', '', regex=True)
     df['특이사항'] = df['특이사항'].str.replace(r'\[기준값 변경 후 첫 생산\s*🔔\]\s*', '', regex=True)
     df['특이사항'] = df['특이사항'].str.replace("nan", "", regex=False).str.strip()
 
+    # 내부 연산용 시간 역순 정렬 (최신이 상단, 과거가 하단)
     df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
 
     try:
@@ -227,14 +234,19 @@ def load_from_db():
             df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
     except: pass
 
+    # =========================================================================
+    # [핵심 로직] 제품/설비명의 띄어쓰기를 임시로 모두 무시하고(통일화) 진짜 첫 배치를 찾습니다.
     df['norm_p'] = df['제품명'].str.replace(" ", "").str.lower()
     df['norm_e'] = df['생산설비'].str.replace(" ", "").str.lower()
     
+    # [원복 및 통일화 완료] 해당 제품을 해당 설비에서 역사상 처음 볶았을 때 (tail=과거 데이터)
     f_idx = df.groupby(['norm_p', 'norm_e']).tail(1).index
     df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
     
     df = df.drop(columns=['norm_p', 'norm_e'])
+    # =========================================================================
     
+    # 설비와 무관하게 "공장 전체 그날(당일)의 제일 마지막 단일 배치"에만 표시
     l_idx = df.groupby('생산일').head(1).index
     df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
     
@@ -351,10 +363,8 @@ def admin_menu_dialog():
                         
                         nprod = st.selectbox("제품", opts, index=opts.index(row[0]), key="admin_sel_prod")
                         neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0, key="admin_sel_equip")
-                        
-                        # [수정] 수정 모드에서도 120kg은 125kg으로 표시
+                        # 수정 모드에서도 120kg 설비는 125kg로 표기되도록 연동
                         namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "125kg" if "120" in neq else "-")
-                        
                         nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
                         nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
                         nrm = st.text_input("특이사항", value=row[6], key="admin_txt_rmk")
@@ -382,10 +392,7 @@ def admin_menu_dialog():
                             if not p_dt: continue 
                             
                             pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
-                            
-                            # [수정] 과거 엑셀 업로드 시에도 120이면 무조건 125kg으로 기록
                             am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "120" in eq else "-")
-                            
                             rm = str(r.get('특이사항', '')).strip()
                             tgt = get_historical_target(pd_name, p_dt)
                             diff = round(meas - tgt, 1)
@@ -405,9 +412,11 @@ def admin_menu_dialog():
                 try:
                     df_all = pd.read_sql_query(text("SELECT * FROM color_records"), get_engine())
                     if not df_all.empty:
+                        # 생산일(과거순) -> 당일 기존 고유번호(생산순) 정렬 후 번호 재할당
                         df_all = df_all.sort_values(by=['production_date', 'id'], ascending=[True, True]).reset_index(drop=True)
                         df_all['id'] = df_all.index + 1
                         
+                        # PostgreSQL: 테이블 데이터 지우고 인덱스 재시작, 그 후 Pandas to_sql 로 일괄 삽입
                         db_execute("TRUNCATE TABLE color_records RESTART IDENTITY;")
                         df_all.to_sql('color_records', get_engine(), if_exists='append', index=False)
                         
@@ -472,7 +481,7 @@ def admin_menu_dialog():
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 st.dataframe(pd.DataFrame(ws).sort_values(by="총", ascending=False).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
         with t8:
-            st.info("작업자 명단 관리 및 과거 엑셀 데이터 명칭 강제 통일화 도구입니다.")
+            st.info("작업자 관리 및 DB 일괄 정화 도구입니다.")
             c_w1, c_w2 = st.columns(2)
             with c_w1:
                 nw = st.text_input("새 작업자 이름", key="admin_new_worker")
@@ -494,17 +503,15 @@ def admin_menu_dialog():
                 db_execute("UPDATE color_records SET equipment = '뷸러 120kg' WHERE REPLACE(equipment, ' ', '') LIKE :v", {"v": "%120%"})
                 st.cache_data.clear(); st.session_state['show_toast'] = "데이터 명칭 100% 통일화 완료!"; st.rerun()
                 
-            # =========================================================
-            # [핵심 추가] 뷸러 120kg 과거 기록 투입량 일괄 수정 버튼
-            # =========================================================
             st.markdown("---")
-            st.error("🛠️ **투입량 일괄 수정 (뷸러 120kg -> 125kg)**")
-            st.caption("과거 기록 중 뷸러 120kg 설비의 투입량을 기존 120kg에서 실제 투입량인 125kg으로 일괄 변경합니다.")
-            if st.button("✨ 뷸러 120kg 투입량 '125kg'으로 일괄 수정", type="primary", use_container_width=True, key="admin_btn_fix_125"):
-                db_execute("UPDATE color_records SET input_amount = '125kg' WHERE equipment LIKE :v", {"v": "%120%"})
-                st.cache_data.clear(); st.session_state['show_toast'] = "투입량 125kg 일괄 수정 완료!"; st.rerun()
-            # =========================================================
-
+            st.error("🛠️ **뷸러 120kg 투입량 일괄 수정 (120kg → 125kg)**")
+            st.caption("과거에 '120kg'으로 잘못 기록된 뷸러 120kg 설비의 투입량을 실제에 맞게 '125kg'으로 일괄 변경합니다.")
+            if st.button("🚀 뷸러 120kg 투입량 125kg으로 일괄 변경", type="primary", use_container_width=True, key="admin_btn_update_125"):
+                db_execute("UPDATE color_records SET input_amount = '125kg' WHERE equipment LIKE '%120%' AND input_amount = '120kg'")
+                st.cache_data.clear()
+                st.session_state['show_toast'] = "125kg 일괄 변경 완료!"
+                st.rerun()
+                
         with t9:
             st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
             pred_data = get_ai_predictions()
@@ -551,7 +558,7 @@ with tab_n:
         with cs4:
             if "버닝" in equip_clean: input_amount_val = st.selectbox("원료 투입량", ["1.35kg", "2.5kg", "3.75kg"], key="main_amt_sel")
             else:
-                # [수정] 뷸러 120kg 선택 시 투입량을 125kg으로 자동 고정
+                # 뷸러 120kg 선택 시 투입량 기본값을 125kg로 설정
                 input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "125kg" if "120" in equip_clean else "-"
                 st.text_input("투입량 (고정)", input_amount_val, disabled=True, key="main_amt_txt")
                 
@@ -561,7 +568,7 @@ with tab_n:
                 "🔍 제품명 검색 및 선택", 
                 list(TARGET_DATA.keys()), 
                 index=None, 
-                placeholder="제품명을 클릭하여 검색하세요 (우측 'X' 버튼으로 즉시 지 지우기)", 
+                placeholder="제품명을 클릭하여 검색하세요 (우측 'X' 버튼으로 즉시 지우기)", 
                 key="main_prod"
             )
             if selected_product and ACTIVE_NOTICES.get(selected_product): 
@@ -652,6 +659,7 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
+        # [정렬 정상화] 설비 묶음(버닝->태환...) + 시간 역순(최신 생산일 먼저) + 번호 정순
         eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
         ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
         
