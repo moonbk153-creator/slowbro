@@ -59,7 +59,7 @@ def safe_date_parse(val):
     except: return v
 
 # ----------------------------------------------------
-# 2. DB 관리 및 보조 함수 
+# 2. DB 관리 및 보조 함수 (Lock 방지 적용)
 # ----------------------------------------------------
 def get_db_conn():
     conn = sqlite3.connect(DB_FILE, timeout=20.0, check_same_thread=False)
@@ -237,7 +237,8 @@ def auto_fill_input_amount(row):
         if "태환" in eq: return "12kg"
         elif "프로밧" in eq: return "25kg"
         elif "60" in eq: return "60kg"
-        elif "120" in eq: return "120kg"
+        # 120kg 설비일 경우 기본값 125kg 반환
+        elif "120" in eq: return "125kg"
     return amt
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -298,8 +299,7 @@ def load_from_db():
             mask = df['고유번호'].isin(target_change_first_ids)
             df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
-        # =========================================================================
-        # [핵심 로직] 제품/설비명의 띄어쓰기를 임시로 모두 무시하고(통일화) 진짜 첫 배치를 찾습니다.
+        # [원복 및 통일화] 제품명과 설비명 띄어쓰기 무시하고 역사상 첫 배치 찾기
         df['norm_p'] = df['제품명'].str.replace(" ", "").str.lower()
         df['norm_e'] = df['생산설비'].str.replace(" ", "").str.lower()
         
@@ -307,7 +307,6 @@ def load_from_db():
         df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
         
         df = df.drop(columns=['norm_p', 'norm_e'])
-        # =========================================================================
         
         # 설비와 무관하게 "공장 전체 그날(당일)의 제일 마지막 단일 배치"에만 표시
         l_idx = df.groupby('생산일').head(1).index
@@ -398,7 +397,7 @@ def admin_menu_dialog():
         try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
         except: pass
         
-        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준/이력 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 데이터 정화", "🔮 AI 예측"])
+        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 데이터 정화", "🔮 AI 예측"])
         
         with t1:
             st.info("오늘 생산된 배치 확인 관리")
@@ -443,7 +442,9 @@ def admin_menu_dialog():
                         
                         nprod = st.selectbox("제품", opts, index=opts.index(row[0]), key="admin_sel_prod")
                         neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0, key="admin_sel_equip")
-                        namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "120kg" if "120" in neq else "-")
+                        
+                        # 수정 모드에서도 120kg 설비는 125kg로 표기
+                        namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "125kg" if "120" in neq else "-")
                         nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
                         nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
                         nrm = st.text_input("특이사항", value=row[6], key="admin_txt_rmk")
@@ -473,7 +474,8 @@ def admin_menu_dialog():
                                 if not p_dt: continue 
                                 
                                 pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
-                                am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "120kg" if "120" in eq else "-")
+                                # 엑셀 업로드 시에도 120kg은 자동으로 125kg 기록
+                                am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "120" in eq else "-")
                                 rm = str(r.get('특이사항', '')).strip()
                                 tgt = get_historical_target(pd_name, p_dt)
                                 diff = round(meas - tgt, 1)
@@ -489,13 +491,12 @@ def admin_menu_dialog():
             
             st.markdown("---")
             st.error("🛠️ **DB 고유번호 꼬임 해결 (초기화 및 재정렬)**")
-            st.caption("과거 데이터를 나중에 업로드하여 고유번호(순서)가 날짜와 맞지 않게 꼬였을 때, 아래 버튼을 누르면 생산일자 순으로 고유번호를 1번부터 깔끔하게 재정렬합니다.")
+            st.caption("과거 데이터를 나중에 업로드하여 고유번호(순서)가 날짜와 맞지 않게 꼬였을 때, 아래 버튼을 누르면 생산일자 순으로 고유번호를 깔끔하게 재정렬합니다.")
             if st.button("🧹 고유번호 날짜순 전면 재정렬", type="primary", key="admin_btn_reindex"):
                 conn = get_db_conn()
                 try:
                     df_all = pd.read_sql_query("SELECT * FROM color_records", conn)
                     if not df_all.empty:
-                        # 생산일(과거순) -> 당일 기존 고유번호(생산순) 정렬
                         df_all = df_all.sort_values(by=['production_date', 'id'], ascending=[True, True]).reset_index(drop=True)
                         df_all['id'] = df_all.index + 1
                         
@@ -574,7 +575,7 @@ def admin_menu_dialog():
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 st.dataframe(pd.DataFrame(ws).sort_values(by="총", ascending=False).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
         with t8:
-            st.info("작업자 명단 추가/삭제 및 과거 엑셀 데이터 명칭 강제 통일화 도구입니다.")
+            st.info("작업자 관리 및 DB 일괄 정화 도구입니다.")
             c_w1, c_w2 = st.columns(2)
             with c_w1:
                 nw = st.text_input("새 작업자 이름", key="admin_new_worker")
@@ -590,20 +591,30 @@ def admin_menu_dialog():
             if st.button("✨ 데이터 명칭 전면 통일화 (첫 배치 오류 완전 해결)", type="primary", use_container_width=True, key="admin_btn_clean_db"):
                 conn = get_db_conn()
                 try:
-                    # 1. 띄어쓰기 및 양옆 공백 제거 업데이트 (제품명, 작업자)
                     conn.execute("UPDATE color_records SET worker = TRIM(worker), product_name = TRIM(product_name)")
-                    
-                    # 2. 설비명 강제 통일 (엑셀에서 '태환12kg', '태환 12kg ' 등으로 적힌 것을 모두 시스템명으로 강제 덮어쓰기)
                     conn.execute("UPDATE color_records SET equipment = '버닝' WHERE REPLACE(equipment, ' ', '') LIKE '%버닝%'")
                     conn.execute("UPDATE color_records SET equipment = '태환 12kg' WHERE REPLACE(equipment, ' ', '') LIKE '%태환%'")
                     conn.execute("UPDATE color_records SET equipment = '프로밧 25kg' WHERE REPLACE(equipment, ' ', '') LIKE '%프로밧%'")
                     conn.execute("UPDATE color_records SET equipment = '뷸러 60kg' WHERE REPLACE(equipment, ' ', '') LIKE '%60%'")
                     conn.execute("UPDATE color_records SET equipment = '뷸러 120kg' WHERE REPLACE(equipment, ' ', '') LIKE '%120%'")
-                    
                     conn.commit()
                 finally:
                     conn.close()
                 st.cache_data.clear(); st.session_state['show_toast'] = "데이터 명칭 100% 통일화 완료!"; st.rerun()
+                
+            st.markdown("---")
+            st.error("🛠️ **뷸러 120kg 투입량 일괄 수정 (120kg → 125kg)**")
+            st.caption("과거에 '120kg'으로 잘못 기록된 뷸러 120kg 설비의 투입량을 실제에 맞게 '125kg'으로 일괄 변경합니다.")
+            if st.button("🚀 뷸러 120kg 투입량 125kg으로 일괄 변경", type="primary", use_container_width=True, key="admin_btn_update_125"):
+                conn = get_db_conn()
+                try:
+                    conn.execute("UPDATE color_records SET input_amount = '125kg' WHERE equipment LIKE '%120%' AND input_amount = '120kg'")
+                    conn.commit()
+                finally:
+                    conn.close()
+                st.cache_data.clear()
+                st.session_state['show_toast'] = "125kg 일괄 변경 완료!"
+                st.rerun()
                 
         with t9:
             st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
@@ -651,7 +662,8 @@ with tab_n:
         with cs4:
             if "버닝" in equip_clean: input_amount_val = st.selectbox("원료 투입량", ["1.35kg", "2.5kg", "3.75kg"], key="main_amt_sel")
             else:
-                input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "120kg" if "120" in equip_clean else "-"
+                # 뷸러 120kg 선택 시 투입량 기본값을 125kg로 설정
+                input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "125kg" if "120" in equip_clean else "-"
                 st.text_input("투입량 (고정)", input_amount_val, disabled=True, key="main_amt_txt")
                 
         col_p1, col_p2 = st.columns([2, 1])
@@ -751,6 +763,7 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
+        # [정렬 정상화] 설비 묶음(버닝->태환...) + 시간 역순(최신 생산일 먼저) + 번호 정순
         eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
         ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
         
