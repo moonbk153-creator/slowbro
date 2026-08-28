@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 from datetime import datetime, timedelta
 import io 
 import pytz
 import numpy as np
 import re
+from sqlalchemy import create_engine, text
 
 # [최적화] 공휴일 로드 및 오류 방지
 try:
@@ -27,7 +27,7 @@ if 'show_toast' in st.session_state:
     st.toast(st.session_state['show_toast'], icon="✅")
     del st.session_state['show_toast']
 
-EXCEL_FILE, DB_FILE = 'data sheet.xlsx', 'color_management.db'
+EXCEL_FILE = 'data sheet.xlsx'
 EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
 ADMIN_PASSWORD, ACCESS_PASSWORD = st.secrets["ADMIN_PASSWORD"], st.secrets["APP_PASSWORD"]
 
@@ -59,175 +59,105 @@ def safe_date_parse(val):
     except: return v
 
 # ----------------------------------------------------
-# 2. DB 관리 및 보조 함수 
+# 2. 클라우드 DB 연동 (Supabase PostgreSQL + SQLAlchemy)
 # ----------------------------------------------------
-def get_db_conn():
-    conn = sqlite3.connect(DB_FILE, timeout=20.0, check_same_thread=False)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-    except:
-        pass
-    return conn
+@st.cache_resource
+def get_engine():
+    db_url = st.secrets["DB_URL"].replace("postgres://", "postgresql://")
+    return create_engine(db_url, pool_pre_ping=True)
+
+def db_execute(query, params={}):
+    with get_engine().begin() as conn:
+        conn.execute(text(query), params)
+
+def db_fetchall(query, params={}):
+    with get_engine().connect() as conn:
+        res = conn.execute(text(query), params)
+        return [tuple(r) for r in res]
+
+def db_fetchone(query, params={}):
+    with get_engine().connect() as conn:
+        res = conn.execute(text(query), params)
+        r = res.fetchone()
+        return tuple(r) if r else None
 
 def init_db():
-    conn = get_db_conn()
-    try:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS color_records (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, production_date TEXT, equipment TEXT, worker TEXT, product_name TEXT, target_value REAL, measured_value REAL, difference REAL, status TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS target_history (id INTEGER PRIMARY KEY AUTOINCREMENT, product_name TEXT, target_value REAL, effective_date TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS product_notices (product_name TEXT PRIMARY KEY, notice_text TEXT, start_date TEXT, end_date TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS workers (name TEXT PRIMARY KEY)''')
-        
-        c.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_target_hist ON target_history(product_name, effective_date)")
-        
-        c.execute("SELECT count(*) FROM workers")
-        if c.fetchone()[0] == 0:
-            for w in ["윤승태", "오세현", "조성윤", "이민형"]: c.execute("INSERT INTO workers (name) VALUES (?)", (w,))
-        
-        c.execute("PRAGMA table_info(color_records)")
-        cols = [info[1] for info in c.fetchall()]
-        if "remarks" not in cols: c.execute("ALTER TABLE color_records ADD COLUMN remarks TEXT DEFAULT ''")
-        if "input_amount" not in cols: c.execute("ALTER TABLE color_records ADD COLUMN input_amount TEXT DEFAULT '-'")
-        if "checked" not in cols: c.execute("ALTER TABLE color_records ADD COLUMN checked INTEGER DEFAULT 0")
-        conn.commit()
-    finally:
-        conn.close()
+    db_execute('''CREATE TABLE IF NOT EXISTS color_records (id SERIAL PRIMARY KEY, timestamp TEXT, production_date TEXT, equipment TEXT, worker TEXT, product_name TEXT, target_value REAL, measured_value REAL, difference REAL, status TEXT, remarks TEXT DEFAULT '', input_amount TEXT DEFAULT '-', checked INTEGER DEFAULT 0)''')
+    db_execute('''CREATE TABLE IF NOT EXISTS target_history (id SERIAL PRIMARY KEY, product_name TEXT, target_value REAL, effective_date TEXT)''')
+    db_execute('''CREATE TABLE IF NOT EXISTS product_notices (product_name TEXT PRIMARY KEY, notice_text TEXT, start_date TEXT, end_date TEXT)''')
+    db_execute('''CREATE TABLE IF NOT EXISTS workers (name TEXT PRIMARY KEY)''')
+    
+    db_execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
+    db_execute("CREATE INDEX IF NOT EXISTS idx_target_hist ON target_history(product_name, effective_date)")
+    
+    cnt = db_fetchone("SELECT count(*) FROM workers")[0]
+    if cnt == 0:
+        for w in ["윤승태", "오세현", "조성윤", "이민형"]: 
+            db_execute("INSERT INTO workers (name) VALUES (:w)", {"w": w})
 
 def get_all_workers():
-    conn = get_db_conn()
-    try:
-        rows = conn.execute("SELECT name FROM workers").fetchall()
-        return [r[0] for r in rows]
-    finally:
-        conn.close()
+    return [r[0] for r in db_fetchall("SELECT name FROM workers")]
 
 def add_worker(name):
-    conn = get_db_conn()
     try: 
-        conn.execute("INSERT INTO workers (name) VALUES (?)", (name.strip(),))
-        conn.commit()
+        db_execute("INSERT INTO workers (name) VALUES (:name)", {"name": name.strip()})
         return True
-    except: 
-        return False
-    finally: 
-        conn.close()
+    except: return False
 
 def delete_worker(name):
-    conn = get_db_conn()
-    try:
-        conn.execute("DELETE FROM workers WHERE name = ?", (name,))
-        conn.commit()
-    finally:
-        conn.close()
+    db_execute("DELETE FROM workers WHERE name = :name", {"name": name})
 
 def update_checked_status(record_ids, status_val):
-    conn = get_db_conn()
-    try:
-        for r in record_ids: conn.execute("UPDATE color_records SET checked=? WHERE id=?", (status_val, r))
-        conn.commit()
-    finally:
-        conn.close()
+    for r in record_ids: 
+        db_execute("UPDATE color_records SET checked=:status WHERE id=:id", {"status": status_val, "id": r})
 
 def delete_from_db(r_id):
-    conn = get_db_conn()
-    try:
-        conn.execute("DELETE FROM color_records WHERE id = ?", (r_id,))
-        conn.commit()
-    finally:
-        conn.close()
+    db_execute("DELETE FROM color_records WHERE id = :id", {"id": r_id})
 
 def update_db(r_id, d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt, chk=0):
-    conn = get_db_conn()
-    try:
-        conn.execute('UPDATE color_records SET production_date=?, equipment=?, worker=?, product_name=?, target_value=?, measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=? WHERE id=?', 
-                  (d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt, chk, r_id))
-        conn.commit()
-    finally:
-        conn.close()
+    db_execute('''UPDATE color_records SET production_date=:pd, equipment=:eq, worker=:wk, product_name=:p, target_value=:tgt, measured_value=:meas, difference=:diff, status=:st_val, remarks=:rmks, input_amount=:amt, checked=:chk WHERE id=:id''', 
+              {"pd":d_date, "eq":str(eq).strip(), "wk":str(wk).strip(), "p":str(p).strip(), "tgt":tgt, "meas":meas, "diff":diff, "st_val":st_val, "rmks":rmks, "amt":amt, "chk":chk, "id":r_id})
 
 def get_historical_target(p_name, d_str):
-    conn = get_db_conn()
-    try:
-        r = conn.execute('SELECT target_value FROM target_history WHERE product_name=? AND effective_date <= ? ORDER BY effective_date DESC, id DESC LIMIT 1', (p_name, d_str)).fetchone()
-        return r[0] if r else TARGET_DATA.get(p_name, 0.0)
-    finally:
-        conn.close()
+    r = db_fetchone('SELECT target_value FROM target_history WHERE product_name=:p AND effective_date <= :d ORDER BY effective_date DESC, id DESC LIMIT 1', {"p":p_name, "d":d_str})
+    return r[0] if r else TARGET_DATA.get(p_name, 0.0)
 
 def save_notice(p, txt, s_date, e_date):
-    conn = get_db_conn()
-    try:
-        conn.execute('INSERT OR REPLACE INTO product_notices (product_name, notice_text, start_date, end_date) VALUES (?, ?, ?, ?)', (p, txt, s_date, e_date))
-        conn.commit()
-    finally:
-        conn.close()
+    db_execute('''INSERT INTO product_notices (product_name, notice_text, start_date, end_date) VALUES (:p, :txt, :sd, :ed) ON CONFLICT (product_name) DO UPDATE SET notice_text=EXCLUDED.notice_text, start_date=EXCLUDED.start_date, end_date=EXCLUDED.end_date''', {"p":p, "txt":txt, "sd":s_date, "ed":e_date})
 
 def delete_notice(p):
-    conn = get_db_conn()
-    try:
-        conn.execute("DELETE FROM product_notices WHERE product_name = ?", (p,))
-        conn.commit()
-    finally:
-        conn.close()
+    db_execute("DELETE FROM product_notices WHERE product_name = :p", {"p": p})
 
 def get_all_active_notices(t_str):
-    conn = get_db_conn()
-    try:
-        rows = conn.execute('SELECT product_name, notice_text FROM product_notices WHERE start_date <= ? AND end_date >= ?', (t_str, t_str)).fetchall()
-        return {r[0]: r[1] for r in rows}
-    finally:
-        conn.close()
+    rows = db_fetchall('SELECT product_name, notice_text FROM product_notices WHERE start_date <= :t AND end_date >= :t', {"t":t_str})
+    return {r[0]: r[1] for r in rows}
 
 def get_raw_notice(p):
-    conn = get_db_conn()
-    try:
-        r = conn.execute("SELECT notice_text, start_date, end_date FROM product_notices WHERE product_name=?", (p,)).fetchone()
-        return r
-    finally:
-        conn.close()
+    return db_fetchone("SELECT notice_text, start_date, end_date FROM product_notices WHERE product_name=:p", {"p":p})
 
 def save_to_db(d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt):
     ts = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
-    conn = get_db_conn()
-    try:
-        conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 
-                  (ts, d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt))
-        conn.commit()
-    finally:
-        conn.close()
+    db_execute('''INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (:ts, :pd, :eq, :wk, :p, :tgt, :meas, :diff, :st_val, :rmks, :amt)''', 
+              {"ts":ts, "pd":d_date, "eq":str(eq).strip(), "wk":str(wk).strip(), "p":str(p).strip(), "tgt":tgt, "meas":meas, "diff":diff, "st_val":st_val, "rmks":rmks, "amt":amt})
 
 def check_recent_duplicate(d_date, eq, p, meas_val):
-    conn = get_db_conn()
-    try:
-        r = conn.execute('SELECT measured_value, timestamp FROM color_records WHERE production_date=? AND equipment=? AND product_name=? ORDER BY id DESC LIMIT 1', (d_date, str(eq).strip(), str(p).strip())).fetchone()
-        if r and float(r[0]) == float(meas_val):
-            try:
-                if (get_now_kst() - datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")).total_seconds() < 30: return True 
-            except: pass
-        return False
-    finally:
-        conn.close()
+    r = db_fetchone('SELECT measured_value, timestamp FROM color_records WHERE production_date=:pd AND equipment=:eq AND product_name=:p ORDER BY id DESC LIMIT 1', {"pd":d_date, "eq":str(eq).strip(), "p":str(p).strip()})
+    if r and float(r[0]) == float(meas_val):
+        try:
+            if (get_now_kst() - datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")).total_seconds() < 30: return True 
+        except: pass
+    return False
 
 def get_last_record(p):
-    conn = get_db_conn()
-    try:
-        r = conn.execute('SELECT production_date, measured_value, status FROM color_records WHERE product_name = ? ORDER BY production_date DESC, timestamp DESC LIMIT 1', (str(p).strip(),)).fetchone()
-        return r
-    finally:
-        conn.close()
+    return db_fetchone('SELECT production_date, measured_value, status FROM color_records WHERE product_name = :p ORDER BY production_date DESC, timestamp DESC LIMIT 1', {"p":str(p).strip()})
 
 def get_equipment_last_records(p_name):
-    conn = get_db_conn()
-    try:
-        query = """
-            WITH RankedRecords AS (SELECT equipment, production_date, measured_value, status, id, ROW_NUMBER() OVER (PARTITION BY equipment ORDER BY production_date DESC, timestamp DESC, id DESC) as rn FROM color_records WHERE product_name = ?), 
-            EquipCounts AS (SELECT equipment, COUNT(*) as cnt FROM color_records WHERE product_name = ? GROUP BY equipment)
-            SELECT r.equipment, r.production_date, r.measured_value, r.status, c.cnt FROM RankedRecords r JOIN EquipCounts c ON r.equipment = c.equipment WHERE r.rn = 1 ORDER BY c.cnt DESC, r.production_date DESC
-        """
-        rows = conn.execute(query, (str(p_name).strip(), str(p_name).strip())).fetchall()
-        return rows
-    finally:
-        conn.close()
+    query = """
+        WITH RankedRecords AS (SELECT equipment, production_date, measured_value, status, id, ROW_NUMBER() OVER (PARTITION BY equipment ORDER BY production_date DESC, timestamp DESC, id DESC) as rn FROM color_records WHERE product_name = :p), 
+        EquipCounts AS (SELECT equipment, COUNT(*) as cnt FROM color_records WHERE product_name = :p GROUP BY equipment)
+        SELECT r.equipment, r.production_date, r.measured_value, r.status, c.cnt FROM RankedRecords r JOIN EquipCounts c ON r.equipment = c.equipment WHERE r.rn = 1 ORDER BY c.cnt DESC, r.production_date DESC
+    """
+    return db_fetchall(query, {"p":str(p_name).strip()})
 
 def auto_fill_input_amount(row):
     eq = str(row['생산설비']).lower().replace(" ", "")
@@ -237,58 +167,56 @@ def auto_fill_input_amount(row):
         if "태환" in eq: return "12kg"
         elif "프로밧" in eq: return "25kg"
         elif "60" in eq: return "60kg"
-        elif "120" in eq: return "125kg"
+        elif "120" in eq: return "125kg" # [수정] 뷸러120kg -> 125kg 적용
     return amt
 
 @st.cache_data(show_spinner=False, ttl=600)
 def load_from_db():
-    conn = get_db_conn()
+    q = """
+    SELECT 
+        c.id as 고유번호, c.timestamp as 입력일시, c.production_date as 생산일, 
+        c.equipment as 생산설비, COALESCE(c.input_amount, '-') as 투입량, 
+        c.worker as 작업자, c.product_name as 제품명, c.measured_value as 측정색도, 
+        COALESCE(c.remarks, '') as 특이사항, COALESCE(c.checked, 0) as checked_status, 
+        COALESCE(
+            (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name AND th.effective_date <= c.production_date ORDER BY th.effective_date DESC LIMIT 1), 
+            (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name ORDER BY th.effective_date ASC LIMIT 1), 
+            0.0
+        ) as 기준색도 
+    FROM color_records c
+    """
+    try: 
+        df = pd.read_sql_query(text(q), get_engine())
+    except Exception: 
+        return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
+
+    if df.empty:
+        return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
+
+    df['생산일'] = df['생산일'].apply(safe_date_parse)
+    df['제품명'] = df['제품명'].astype(str).str.strip()
+    df['생산설비'] = df['생산설비'].astype(str).str.strip()
+    df['작업자'] = df['작업자'].astype(str).str.strip().replace(['nan', 'None', '', 'NaN'], '미입력(과거기록)')
+    df['투입량'] = df.apply(auto_fill_input_amount, axis=1)
+    df['확인여부'] = df['checked_status'].apply(lambda x: "확인완료 ✅" if x == 1 else "미확인 ❌")
+
+    df['측정색도'] = pd.to_numeric(df['측정색도'], errors='coerce')
+    df['기준색도'] = pd.to_numeric(df['기준색도'], errors='coerce')
+    df['오차'] = (df['측정색도'] - df['기준색도'])
+    df['판정'] = "합격 🟢"
+    df.loc[df['오차'].abs() > 2.0, '판정'] = "불합격 🔴"
+    df.loc[df['오차'].isna(), '판정'] = "오류"
+    
+    df['특이사항'] = df['특이사항'].fillna('').astype(str)
+    df['특이사항'] = df['특이사항'].str.replace(r'\[설비 첫\s*배치\s*🚀\]\s*', '', regex=True)
+    df['특이사항'] = df['특이사항'].str.replace(r'\[마지막 배치\s*🏁\]\s*', '', regex=True)
+    df['특이사항'] = df['특이사항'].str.replace(r'\[기준값 변경 후 첫 생산\s*🔔\]\s*', '', regex=True)
+    df['특이사항'] = df['특이사항'].str.replace("nan", "", regex=False).str.strip()
+
+    df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
+
     try:
-        q = """
-        SELECT 
-            c.id as 고유번호, c.timestamp as 입력일시, c.production_date as 생산일, 
-            c.equipment as 생산설비, COALESCE(c.input_amount, '-') as 투입량, 
-            c.worker as 작업자, c.product_name as 제품명, c.measured_value as 측정색도, 
-            COALESCE(c.remarks, '') as 특이사항, COALESCE(c.checked, 0) as checked_status, 
-            COALESCE(
-                (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name AND th.effective_date <= c.production_date ORDER BY th.effective_date DESC LIMIT 1), 
-                (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name ORDER BY th.effective_date ASC LIMIT 1), 
-                0.0
-            ) as 기준색도 
-        FROM color_records c
-        """
-        try: df = pd.read_sql_query(q, conn)
-        except Exception: 
-            return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
-
-        if df.empty:
-            return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
-
-        df['생산일'] = df['생산일'].apply(safe_date_parse)
-        df['제품명'] = df['제품명'].astype(str).str.strip()
-        df['생산설비'] = df['생산설비'].astype(str).str.strip()
-        df['작업자'] = df['작업자'].astype(str).str.strip().replace(['nan', 'None', '', 'NaN'], '미입력(과거기록)')
-        df['투입량'] = df.apply(auto_fill_input_amount, axis=1)
-        df['확인여부'] = df['checked_status'].apply(lambda x: "확인완료 ✅" if x == 1 else "미확인 ❌")
-
-        df['측정색도'] = pd.to_numeric(df['측정색도'], errors='coerce')
-        df['기준색도'] = pd.to_numeric(df['기준색도'], errors='coerce')
-        df['오차'] = (df['측정색도'] - df['기준색도'])
-        df['판정'] = "합격 🟢"
-        df.loc[df['오차'].abs() > 2.0, '판정'] = "불합격 🔴"
-        df.loc[df['오차'].isna(), '판정'] = "오류"
-        
-        # 가짜 태그 흔적 텍스트 완벽 정화(정규식)
-        df['특이사항'] = df['특이사항'].fillna('').astype(str)
-        df['특이사항'] = df['특이사항'].str.replace(r'\[설비 첫\s*배치\s*🚀\]\s*', '', regex=True)
-        df['특이사항'] = df['특이사항'].str.replace(r'\[마지막 배치\s*🏁\]\s*', '', regex=True)
-        df['특이사항'] = df['특이사항'].str.replace(r'\[기준값 변경 후 첫 생산\s*🔔\]\s*', '', regex=True)
-        df['특이사항'] = df['특이사항'].str.replace("nan", "", regex=False).str.strip()
-
-        # 내부 연산용 시간 역순 정렬 (최신이 상단, 과거가 하단)
-        df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
-
-        th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn)
+        th_df = pd.read_sql_query(text("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')"), get_engine())
         target_change_first_ids = set()
         for _, r in th_df.iterrows():
             sub = df[(df['제품명'] == r['product_name'].strip()) & (df['생산일'] >= r['effective_date'])]
@@ -297,26 +225,21 @@ def load_from_db():
         if target_change_first_ids:
             mask = df['고유번호'].isin(target_change_first_ids)
             df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
+    except: pass
 
-        # =========================================================================
-        # [핵심 로직] 제품/설비명의 띄어쓰기를 임시로 모두 무시하고(통일화) 진짜 첫 배치를 찾습니다.
-        df['norm_p'] = df['제품명'].str.replace(" ", "").str.lower()
-        df['norm_e'] = df['생산설비'].str.replace(" ", "").str.lower()
-        
-        f_idx = df.groupby(['norm_p', 'norm_e']).tail(1).index
-        df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
-        
-        df = df.drop(columns=['norm_p', 'norm_e'])
-        # =========================================================================
-        
-        # 설비와 무관하게 "공장 전체 그날(당일)의 제일 마지막 단일 배치"에만 표시
-        l_idx = df.groupby('생산일').head(1).index
-        df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
-        
-        df['특이사항'] = df['특이사항'].str.strip()
-        return df[['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
-    finally:
-        conn.close()
+    df['norm_p'] = df['제품명'].str.replace(" ", "").str.lower()
+    df['norm_e'] = df['생산설비'].str.replace(" ", "").str.lower()
+    
+    f_idx = df.groupby(['norm_p', 'norm_e']).tail(1).index
+    df.loc[f_idx, '특이사항'] = "[설비 첫 배치 🚀] " + df.loc[f_idx, '특이사항']
+    
+    df = df.drop(columns=['norm_p', 'norm_e'])
+    
+    l_idx = df.groupby('생산일').head(1).index
+    df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
+    
+    df['특이사항'] = df['특이사항'].str.strip()
+    return df[['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
 
 @st.cache_data(show_spinner=False)
 def get_ai_predictions():
@@ -365,23 +288,18 @@ CURRENT_WORKERS = get_all_workers()
 
 @st.cache_data
 def load_tgt():
-    conn = get_db_conn()
-    try:
-        rows = conn.execute("SELECT product_name, target_value FROM target_history ORDER BY effective_date ASC, id ASC").fetchall()
-        if rows:
-            return {r[0]: r[1] for r in rows}
-        else:
-            try: 
-                df = pd.read_excel(EXCEL_FILE, usecols="C:D", header=1).dropna()
-                targets = {str(r.iloc[0]).strip(): float(r.iloc[1]) if not pd.isna(r.iloc[1]) else 0.0 for i, r in df.iterrows()}
-                for p, v in targets.items():
-                    conn.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (p, v, '2000-01-01'))
-                conn.commit()
-                return targets
-            except: 
-                return {"(데이터 없음)": 0.0}
-    finally:
-        conn.close()
+    rows = db_fetchall("SELECT product_name, target_value FROM target_history ORDER BY effective_date ASC, id ASC")
+    if rows:
+        return {r[0]: r[1] for r in rows}
+    else:
+        try: 
+            df = pd.read_excel(EXCEL_FILE, usecols="C:D", header=1).dropna()
+            targets = {str(r.iloc[0]).strip(): float(r.iloc[1]) if not pd.isna(r.iloc[1]) else 0.0 for i, r in df.iterrows()}
+            for p, v in targets.items():
+                db_execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (:p, :v, '2000-01-01')", {"p":p, "v":v})
+            return targets
+        except: 
+            return {"(데이터 없음)": 0.0}
 
 TARGET_DATA = load_tgt()
 today_str_kst = get_now_kst().strftime("%Y-%m-%d")
@@ -395,10 +313,7 @@ def admin_menu_dialog():
     input_pw_admin = st.text_input("🔒 비밀번호를 입력하세요", type="password", key="admin_pw_input")
     
     if input_pw_admin == ADMIN_PASSWORD:
-        try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
-        except: pass
-        
-        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준/이력 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 데이터 정화", "🔮 AI 예측"])
+        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 데이터 정화", "🔮 AI 예측"])
         
         with t1:
             st.info("오늘 생산된 배치 확인 관리")
@@ -425,14 +340,7 @@ def admin_menu_dialog():
                 if act == "삭제" and st.button("🗑️ 데이터 삭제", key="admin_btn_del_record"):
                     delete_from_db(tid); st.cache_data.clear(); st.session_state['show_toast'] = "삭제됨!"; st.rerun()
                 elif act == "수정":
-                    conn = get_db_conn()
-                    try:
-                        cols = [i[1] for i in conn.execute("PRAGMA table_info(color_records)").fetchall()]
-                        chk_c = "checked" if "checked" in cols else "0"
-                        row = conn.execute(f"SELECT product_name, target_value, production_date, equipment, worker, measured_value, remarks, input_amount, COALESCE({chk_c}, 0) FROM color_records WHERE id=?", (tid,)).fetchone()
-                    finally:
-                        conn.close()
-                        
+                    row = db_fetchone("SELECT product_name, target_value, production_date, equipment, worker, measured_value, remarks, input_amount, COALESCE(checked, 0) FROM color_records WHERE id=:id", {"id":tid})
                     if row:
                         try: def_date = datetime.strptime(row[2], "%Y-%m-%d").date()
                         except: def_date = get_now_kst().date()
@@ -443,7 +351,10 @@ def admin_menu_dialog():
                         
                         nprod = st.selectbox("제품", opts, index=opts.index(row[0]), key="admin_sel_prod")
                         neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0, key="admin_sel_equip")
+                        
+                        # [수정] 수정 모드에서도 120kg은 125kg으로 표시
                         namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "125kg" if "120" in neq else "-")
+                        
                         nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
                         nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
                         nrm = st.text_input("특이사항", value=row[6], key="admin_txt_rmk")
@@ -462,49 +373,43 @@ def admin_menu_dialog():
                 try:
                     df_up = pd.read_excel(up)
                     if all(c in df_up.columns for c in ['생산일', '제품명', '생산설비', '작업자', '측정색도']):
-                        conn = get_db_conn()
-                        try:
-                            for _, r in df_up.iterrows():
-                                if str(r['측정색도']).strip() in ['-', '', 'nan', 'None']: continue
-                                try: meas = float(str(r['측정색도']).strip())
-                                except: continue
-                                
-                                p_dt = safe_date_parse(r['생산일'])
-                                if not p_dt: continue 
-                                
-                                pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
-                                am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "120kg" if "120" in eq else "-")
-                                rm = str(r.get('특이사항', '')).strip()
-                                tgt = get_historical_target(pd_name, p_dt)
-                                diff = round(meas - tgt, 1)
-                                stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
-                                conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (get_now_kst().strftime("%Y-%m-%d %H:%M:%S"), p_dt, eq, wk, pd_name, tgt, meas, diff, stat, rm if rm not in ['nan','None'] else '', am))
-                            conn.commit()
-                            st.cache_data.clear(); st.session_state['show_toast'] = "과거 기록 업로드 성공!"; st.rerun()
-                        finally:
-                            conn.close()
+                        for _, r in df_up.iterrows():
+                            if str(r['측정색도']).strip() in ['-', '', 'nan', 'None']: continue
+                            try: meas = float(str(r['측정색도']).strip())
+                            except: continue
+                            
+                            p_dt = safe_date_parse(r['생산일'])
+                            if not p_dt: continue 
+                            
+                            pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
+                            
+                            # [수정] 과거 엑셀 업로드 시에도 120이면 무조건 125kg으로 기록
+                            am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "120" in eq else "-")
+                            
+                            rm = str(r.get('특이사항', '')).strip()
+                            tgt = get_historical_target(pd_name, p_dt)
+                            diff = round(meas - tgt, 1)
+                            stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
+                            
+                            db_execute('''INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (:ts, :pd, :eq, :wk, :p, :tgt, :meas, :diff, :st, :rm, :amt)''',
+                                      {"ts":get_now_kst().strftime("%Y-%m-%d %H:%M:%S"), "pd":p_dt, "eq":eq, "wk":wk, "p":pd_name, "tgt":tgt, "meas":meas, "diff":diff, "st":stat, "rm":rm if rm not in ['nan','None'] else '', "amt":am})
+                        st.cache_data.clear(); st.session_state['show_toast'] = "과거 기록 업로드 성공!"; st.rerun()
                     else:
                         st.error("엑셀에 필수 열('생산일', '제품명', '생산설비', '작업자', '측정색도')이 부족합니다.")
                 except Exception as e: st.error(f"오류: {e}")
             
             st.markdown("---")
             st.error("🛠️ **DB 고유번호 꼬임 해결 (초기화 및 재정렬)**")
-            st.caption("과거 데이터를 나중에 업로드하여 고유번호(순서)가 날짜와 맞지 않게 꼬였을 때, 아래 버튼을 누르면 생산일자 순으로 고유번호를 1번부터 깔끔하게 재정렬합니다.")
+            st.caption("과거 데이터를 나중에 업로드하여 고유번호(순서)가 날짜와 맞지 않게 꼬였을 때, 아래 버튼을 누르면 생산일자 순으로 고유번호를 깔끔하게 재정렬합니다.")
             if st.button("🧹 고유번호 날짜순 전면 재정렬", type="primary", key="admin_btn_reindex"):
-                conn = get_db_conn()
                 try:
-                    df_all = pd.read_sql_query("SELECT * FROM color_records", conn)
+                    df_all = pd.read_sql_query(text("SELECT * FROM color_records"), get_engine())
                     if not df_all.empty:
-                        # 생산일(과거순) -> 당일 기존 고유번호(생산순) 정렬
                         df_all = df_all.sort_values(by=['production_date', 'id'], ascending=[True, True]).reset_index(drop=True)
                         df_all['id'] = df_all.index + 1
                         
-                        conn.execute("DROP TABLE color_records")
-                        conn.execute('''CREATE TABLE color_records (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, production_date TEXT, equipment TEXT, worker TEXT, product_name TEXT, target_value REAL, measured_value REAL, difference REAL, status TEXT, remarks TEXT DEFAULT '', input_amount TEXT DEFAULT '-', checked INTEGER DEFAULT 0)''')
-                        conn.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
-                        
-                        df_all.to_sql('color_records', conn, if_exists='append', index=False)
-                        conn.commit()
+                        db_execute("TRUNCATE TABLE color_records RESTART IDENTITY;")
+                        df_all.to_sql('color_records', get_engine(), if_exists='append', index=False)
                         
                         st.cache_data.clear()
                         st.session_state['show_toast'] = "고유번호 전면 재정렬 완료! 순서가 정상화되었습니다."
@@ -513,8 +418,6 @@ def admin_menu_dialog():
                         st.info("데이터가 없습니다.")
                 except Exception as e:
                     st.error(f"재정렬 중 오류 발생: {e}")
-                finally:
-                    conn.close()
         
         with t4:
             st.info("제품별 기준 색도 엑셀 파일을 업로드하여 시스템에 즉시 적용합니다.")
@@ -523,16 +426,11 @@ def admin_menu_dialog():
                 try:
                     df_h = pd.read_excel(h_up)
                     if all(c in df_h.columns for c in ['제품명','적용시작일','기준색도']):
-                        conn = get_db_conn()
-                        try:
-                            conn.execute("DELETE FROM target_history")
-                            for _, r in df_h.iterrows():
-                                dt = safe_date_parse(r['적용시작일']) or '2000-01-01'
-                                try: conn.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (str(r['제품명']).strip(), float(r['기준색도']), dt))
-                                except: pass
-                            conn.commit()
-                        finally:
-                            conn.close()
+                        db_execute("TRUNCATE TABLE target_history RESTART IDENTITY;")
+                        for _, r in df_h.iterrows():
+                            dt = safe_date_parse(r['적용시작일']) or '2000-01-01'
+                            try: db_execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (:p, :v, :d)", {"p":str(r['제품명']).strip(), "v":float(r['기준색도']), "d":dt})
+                            except: pass
                         st.cache_data.clear(); 
                         st.session_state['show_toast'] = "제품 기준값이 시스템 전체에 즉시 적용되었습니다!"
                         st.rerun()
@@ -574,7 +472,7 @@ def admin_menu_dialog():
                     ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 st.dataframe(pd.DataFrame(ws).sort_values(by="총", ascending=False).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
         with t8:
-            st.info("작업자 명단 추가/삭제 및 과거 엑셀 데이터 명칭 강제 통일화 도구입니다.")
+            st.info("작업자 명단 관리 및 과거 엑셀 데이터 명칭 강제 통일화 도구입니다.")
             c_w1, c_w2 = st.columns(2)
             with c_w1:
                 nw = st.text_input("새 작업자 이름", key="admin_new_worker")
@@ -588,23 +486,25 @@ def admin_menu_dialog():
             st.error("🛠️ **DB 명칭 불일치 해결 (과거 데이터 통합)**")
             st.caption("과거 엑셀로 업로드한 기록의 설비명이나 제품명에 미세한 오타/띄어쓰기가 있어 같은 제품으로 인식되지 않을 때, 시스템 기준으로 강제 통일시킵니다.")
             if st.button("✨ 데이터 명칭 전면 통일화 (첫 배치 오류 완전 해결)", type="primary", use_container_width=True, key="admin_btn_clean_db"):
-                conn = get_db_conn()
-                try:
-                    # 1. 띄어쓰기 및 양옆 공백 제거 업데이트 (제품명, 작업자)
-                    conn.execute("UPDATE color_records SET worker = TRIM(worker), product_name = TRIM(product_name)")
-                    
-                    # 2. 설비명 강제 통일 (엑셀에서 '태환12kg', '태환 12kg ' 등으로 적힌 것을 모두 시스템명으로 강제 덮어쓰기)
-                    conn.execute("UPDATE color_records SET equipment = '버닝' WHERE REPLACE(equipment, ' ', '') LIKE '%버닝%'")
-                    conn.execute("UPDATE color_records SET equipment = '태환 12kg' WHERE REPLACE(equipment, ' ', '') LIKE '%태환%'")
-                    conn.execute("UPDATE color_records SET equipment = '프로밧 25kg' WHERE REPLACE(equipment, ' ', '') LIKE '%프로밧%'")
-                    conn.execute("UPDATE color_records SET equipment = '뷸러 60kg' WHERE REPLACE(equipment, ' ', '') LIKE '%60%'")
-                    conn.execute("UPDATE color_records SET equipment = '뷸러 120kg' WHERE REPLACE(equipment, ' ', '') LIKE '%120%'")
-                    
-                    conn.commit()
-                finally:
-                    conn.close()
+                db_execute("UPDATE color_records SET worker = TRIM(worker), product_name = TRIM(product_name)")
+                db_execute("UPDATE color_records SET equipment = '버닝' WHERE REPLACE(equipment, ' ', '') LIKE :v", {"v": "%버닝%"})
+                db_execute("UPDATE color_records SET equipment = '태환 12kg' WHERE REPLACE(equipment, ' ', '') LIKE :v", {"v": "%태환%"})
+                db_execute("UPDATE color_records SET equipment = '프로밧 25kg' WHERE REPLACE(equipment, ' ', '') LIKE :v", {"v": "%프로밧%"})
+                db_execute("UPDATE color_records SET equipment = '뷸러 60kg' WHERE REPLACE(equipment, ' ', '') LIKE :v", {"v": "%60%"})
+                db_execute("UPDATE color_records SET equipment = '뷸러 120kg' WHERE REPLACE(equipment, ' ', '') LIKE :v", {"v": "%120%"})
                 st.cache_data.clear(); st.session_state['show_toast'] = "데이터 명칭 100% 통일화 완료!"; st.rerun()
                 
+            # =========================================================
+            # [핵심 추가] 뷸러 120kg 과거 기록 투입량 일괄 수정 버튼
+            # =========================================================
+            st.markdown("---")
+            st.error("🛠️ **투입량 일괄 수정 (뷸러 120kg -> 125kg)**")
+            st.caption("과거 기록 중 뷸러 120kg 설비의 투입량을 기존 120kg에서 실제 투입량인 125kg으로 일괄 변경합니다.")
+            if st.button("✨ 뷸러 120kg 투입량 '125kg'으로 일괄 수정", type="primary", use_container_width=True, key="admin_btn_fix_125"):
+                db_execute("UPDATE color_records SET input_amount = '125kg' WHERE equipment LIKE :v", {"v": "%120%"})
+                st.cache_data.clear(); st.session_state['show_toast'] = "투입량 125kg 일괄 수정 완료!"; st.rerun()
+            # =========================================================
+
         with t9:
             st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
             pred_data = get_ai_predictions()
@@ -651,7 +551,8 @@ with tab_n:
         with cs4:
             if "버닝" in equip_clean: input_amount_val = st.selectbox("원료 투입량", ["1.35kg", "2.5kg", "3.75kg"], key="main_amt_sel")
             else:
-                input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "120kg" if "120" in equip_clean else "-"
+                # [수정] 뷸러 120kg 선택 시 투입량을 125kg으로 자동 고정
+                input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "125kg" if "120" in equip_clean else "-"
                 st.text_input("투입량 (고정)", input_amount_val, disabled=True, key="main_amt_txt")
                 
         col_p1, col_p2 = st.columns([2, 1])
@@ -660,7 +561,7 @@ with tab_n:
                 "🔍 제품명 검색 및 선택", 
                 list(TARGET_DATA.keys()), 
                 index=None, 
-                placeholder="제품명을 클릭하여 검색하세요 (우측 'X' 버튼으로 즉시 지우기)", 
+                placeholder="제품명을 클릭하여 검색하세요 (우측 'X' 버튼으로 즉시 지 지우기)", 
                 key="main_prod"
             )
             if selected_product and ACTIVE_NOTICES.get(selected_product): 
