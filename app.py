@@ -219,8 +219,13 @@ def save_to_db(d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt):
     ts = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db_conn()
     try:
+        # 데이터 등록
         conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 
                   (ts, d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt))
+        
+        # [자동 해제 로직] 해당 제품이 단종(예측 제외) 목록에 있다면 자동으로 삭제하여 복구시킴
+        conn.execute('DELETE FROM excluded_products WHERE product_name = ?', (str(p).strip(),))
+        
         conn.commit()
     finally:
         conn.close()
@@ -327,7 +332,7 @@ def load_from_db():
             mask = df['고유번호'].isin(target_change_first_ids)
             df.loc[mask, '특이사항'] = "[기준값 변경 후 첫 생산 🔔] " + df.loc[mask, '특이사항']
 
-        # [원복 및 통일화] 제품명과 설비명 띄어쓰기 무시하고 역사상 첫 배치 찾기
+        # 제품명과 설비명 띄어쓰기 무시하고 역사상 첫 배치 찾기
         df['norm_p'] = df['제품명'].str.replace(" ", "").str.lower()
         df['norm_e'] = df['생산설비'].str.replace(" ", "").str.lower()
         
@@ -356,7 +361,7 @@ def get_ai_predictions():
     df['생산일_dt'] = pd.to_datetime(df['생산일'], errors='coerce').dt.date
     
     for prod, group in df.groupby('제품명'):
-        # [신규 기능] 예측 제외(단종) 목록에 포함된 제품은 패스
+        # 단종(예측 제외) 목록에 포함된 제품은 AI 예측에서 숨김
         if prod in excluded_products: 
             continue
             
@@ -510,7 +515,13 @@ def admin_menu_dialog():
                                 tgt = get_historical_target(pd_name, p_dt)
                                 diff = round(meas - tgt, 1)
                                 stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
+                                
+                                # DB 입력
                                 conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (get_now_kst().strftime("%Y-%m-%d %H:%M:%S"), p_dt, eq, wk, pd_name, tgt, meas, diff, stat, rm if rm not in ['nan','None'] else '', am))
+                                
+                                # [자동 해제 로직] 과거 기록을 엑셀로 추가해도 시스템이 인지하여 단종 목록에서 자동 삭제
+                                conn.execute('DELETE FROM excluded_products WHERE product_name = ?', (pd_name,))
+                                
                             conn.commit()
                             st.cache_data.clear(); st.session_state['show_toast'] = "과거 기록 업로드 성공!"; st.rerun()
                         finally:
@@ -649,11 +660,8 @@ def admin_menu_dialog():
         with t9:
             st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
             
-            # =========================================================================
-            # [신규 추가] 단종 / 예측 제외 제품 관리 도구
-            # =========================================================================
             with st.expander("🚫 단종/생산종료 제품 예측 제외 관리", expanded=False):
-                st.caption("계약 종료 등으로 더 이상 생산하지 않는 제품을 AI 예측 목록에서 숨깁니다.")
+                st.caption("계약 종료 등으로 더 이상 생산하지 않는 제품을 AI 예측 목록에서 숨깁니다. (생산 재개 시 자동으로 복구됩니다.)")
                 ex_prods = get_excluded_products()
                 # 모든 제품 목록 확보 (타겟 데이터 + 과거 기록)
                 all_prods = sorted(list(set(TARGET_DATA.keys()).union(set(history_df['제품명'].unique()))))
@@ -661,7 +669,7 @@ def admin_menu_dialog():
                 c_ex1, c_ex2 = st.columns(2)
                 with c_ex1:
                     to_exclude = st.selectbox("숨길 제품 선택", [p for p in all_prods if p not in ex_prods], key="sel_ex_prod")
-                    if st.button("➕ 제외 목록에 추가", key="btn_add_ex"):
+                    if st.button("➕ 수동 제외 목록에 추가", key="btn_add_ex"):
                         if to_exclude:
                             add_excluded_product(to_exclude)
                             st.cache_data.clear()
@@ -670,7 +678,7 @@ def admin_menu_dialog():
                 with c_ex2:
                     if ex_prods:
                         to_restore = st.selectbox("제외된 제품 목록 (복구 시 선택)", ex_prods, key="sel_res_prod")
-                        if st.button("🔄 제외 목록에서 복구", key="btn_remove_ex"):
+                        if st.button("🔄 수동으로 제외 해제", key="btn_remove_ex"):
                             if to_restore:
                                 remove_excluded_product(to_restore)
                                 st.cache_data.clear()
@@ -678,7 +686,6 @@ def admin_menu_dialog():
                                 st.rerun()
                     else:
                         st.info("현재 예측 제외된 제품이 없습니다.")
-            # =========================================================================
             
             pred_data = get_ai_predictions()
             if pred_data:
