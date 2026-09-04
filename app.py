@@ -78,6 +78,9 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS product_notices (product_name TEXT PRIMARY KEY, notice_text TEXT, start_date TEXT, end_date TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS workers (name TEXT PRIMARY KEY)''')
         
+        # 단종 제품 관리를 위한 신규 테이블
+        c.execute('''CREATE TABLE IF NOT EXISTS excluded_products (product_name TEXT PRIMARY KEY)''')
+        
         c.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_target_hist ON target_history(product_name, effective_date)")
         
@@ -120,6 +123,32 @@ def delete_worker(name):
         conn.commit()
     finally:
         conn.close()
+
+# ---- 예측 제외(단종) 제품 관리 함수 추가 ----
+def get_excluded_products():
+    conn = get_db_conn()
+    try:
+        rows = conn.execute("SELECT product_name FROM excluded_products").fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+def add_excluded_product(name):
+    conn = get_db_conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO excluded_products (product_name) VALUES (?)", (name.strip(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+def remove_excluded_product(name):
+    conn = get_db_conn()
+    try:
+        conn.execute("DELETE FROM excluded_products WHERE product_name = ?", (name.strip(),))
+        conn.commit()
+    finally:
+        conn.close()
+# ---------------------------------------------
 
 def update_checked_status(record_ids, status_val):
     conn = get_db_conn()
@@ -237,7 +266,6 @@ def auto_fill_input_amount(row):
         if "태환" in eq: return "12kg"
         elif "프로밧" in eq: return "25kg"
         elif "60" in eq: return "60kg"
-        # 120kg 설비일 경우 기본값 125kg 반환
         elif "120" in eq: return "125kg"
     return amt
 
@@ -322,11 +350,16 @@ def get_ai_predictions():
     df = load_from_db()
     if df.empty: return []
     
+    excluded_products = get_excluded_products()
     predict_data = []
     today_d = get_now_kst().date()
     df['생산일_dt'] = pd.to_datetime(df['생산일'], errors='coerce').dt.date
     
     for prod, group in df.groupby('제품명'):
+        # [신규 기능] 예측 제외(단종) 목록에 포함된 제품은 패스
+        if prod in excluded_products: 
+            continue
+            
         unique_dates = sorted(group['생산일_dt'].dropna().drop_duplicates().tolist())
         if len(unique_dates) < 2: continue
         
@@ -442,8 +475,6 @@ def admin_menu_dialog():
                         
                         nprod = st.selectbox("제품", opts, index=opts.index(row[0]), key="admin_sel_prod")
                         neq = st.selectbox("설비", EQUIPMENT_LIST, index=EQUIPMENT_LIST.index(row[3]) if row[3] in EQUIPMENT_LIST else 0, key="admin_sel_equip")
-                        
-                        # 수정 모드에서도 120kg 설비는 125kg로 표기
                         namt = st.selectbox("투입량", ["1.35kg","2.5kg","3.75kg"], index=["1.35kg","2.5kg","3.75kg"].index(row[7]) if row[7] in ["1.35kg","2.5kg","3.75kg"] else 0, key="admin_sel_amt") if "버닝" in neq else ("12kg" if "태환" in neq else "25kg" if "프로밧" in neq else "60kg" if "60" in neq else "125kg" if "120" in neq else "-")
                         nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
                         nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
@@ -474,7 +505,6 @@ def admin_menu_dialog():
                                 if not p_dt: continue 
                                 
                                 pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
-                                # 엑셀 업로드 시에도 120kg은 자동으로 125kg 기록
                                 am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "120" in eq else "-")
                                 rm = str(r.get('특이사항', '')).strip()
                                 tgt = get_historical_target(pd_name, p_dt)
@@ -618,6 +648,38 @@ def admin_menu_dialog():
                 
         with t9:
             st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
+            
+            # =========================================================================
+            # [신규 추가] 단종 / 예측 제외 제품 관리 도구
+            # =========================================================================
+            with st.expander("🚫 단종/생산종료 제품 예측 제외 관리", expanded=False):
+                st.caption("계약 종료 등으로 더 이상 생산하지 않는 제품을 AI 예측 목록에서 숨깁니다.")
+                ex_prods = get_excluded_products()
+                # 모든 제품 목록 확보 (타겟 데이터 + 과거 기록)
+                all_prods = sorted(list(set(TARGET_DATA.keys()).union(set(history_df['제품명'].unique()))))
+                
+                c_ex1, c_ex2 = st.columns(2)
+                with c_ex1:
+                    to_exclude = st.selectbox("숨길 제품 선택", [p for p in all_prods if p not in ex_prods], key="sel_ex_prod")
+                    if st.button("➕ 제외 목록에 추가", key="btn_add_ex"):
+                        if to_exclude:
+                            add_excluded_product(to_exclude)
+                            st.cache_data.clear()
+                            st.session_state['show_toast'] = f"{to_exclude} 제품이 예측에서 제외되었습니다."
+                            st.rerun()
+                with c_ex2:
+                    if ex_prods:
+                        to_restore = st.selectbox("제외된 제품 목록 (복구 시 선택)", ex_prods, key="sel_res_prod")
+                        if st.button("🔄 제외 목록에서 복구", key="btn_remove_ex"):
+                            if to_restore:
+                                remove_excluded_product(to_restore)
+                                st.cache_data.clear()
+                                st.session_state['show_toast'] = f"{to_restore} 제품이 예측에 복구되었습니다."
+                                st.rerun()
+                    else:
+                        st.info("현재 예측 제외된 제품이 없습니다.")
+            # =========================================================================
+            
             pred_data = get_ai_predictions()
             if pred_data:
                 pred_df = pd.DataFrame(pred_data).sort_values('_sort').drop(columns=['_sort'])
@@ -630,7 +692,7 @@ def admin_menu_dialog():
                     return colors
                 st.dataframe(pred_df.style.apply(hl_pred, subset=['생산 필요 상태']).set_properties(**{'text-align': 'center'}), use_container_width=True, hide_index=True)
             else:
-                st.success("데이터가 부족하여 아직 예측할 수 없습니다.")
+                st.success("데이터가 부족하거나 모든 제품이 제외되어 예측할 수 없습니다.")
     elif input_pw_admin != "": st.error("❌ 비밀번호 불일치")
 
 # ----------------------------------------------------
@@ -662,7 +724,6 @@ with tab_n:
         with cs4:
             if "버닝" in equip_clean: input_amount_val = st.selectbox("원료 투입량", ["1.35kg", "2.5kg", "3.75kg"], key="main_amt_sel")
             else:
-                # 뷸러 120kg 선택 시 투입량 기본값을 125kg로 설정
                 input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "125kg" if "120" in equip_clean else "-"
                 st.text_input("투입량 (고정)", input_amount_val, disabled=True, key="main_amt_txt")
                 
@@ -763,7 +824,6 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
-        # [정렬 정상화] 설비 묶음(버닝->태환...) + 시간 역순(최신 생산일 먼저) + 번호 정순
         eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
         ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
         
