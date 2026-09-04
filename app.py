@@ -124,7 +124,7 @@ def delete_worker(name):
     finally:
         conn.close()
 
-# ---- 예측 제외(단종) 제품 관리 함수 추가 ----
+# ---- 예측 제외(단종) 제품 관리 함수 ----
 def get_excluded_products():
     conn = get_db_conn()
     try:
@@ -608,13 +608,22 @@ def admin_menu_dialog():
                     except: pass
                 else: inact.append({"제품명":p, "최종 생산":"없음", "경과":"이력 없음"})
             st.dataframe(pd.DataFrame(inact), use_container_width=True, hide_index=True)
+            
+        # =========================================================================
+        # [신규 추가] 통계 탭: 삭제된 작업자 이름 뒤에 (퇴사) 표시
+        # =========================================================================
         with t7:
             if not history_df.empty:
                 ws = []
                 for nm, grp in history_df.groupby('작업자'):
+                    # 현재 등록된 작업자 목록(CURRENT_WORKERS)에 없고, 기본값이 아니라면 (퇴사) 추가
+                    disp_nm = f"{nm} (퇴사)" if nm not in CURRENT_WORKERS and nm != '미입력(과거기록)' else nm
+                    
                     tc, fc = len(grp), len(grp[grp['판정'].str.contains("불합격", na=False)])
-                    ws.append({"작업자":nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
+                    ws.append({"작업자": disp_nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 st.dataframe(pd.DataFrame(ws).sort_values(by="총", ascending=False).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
+        # =========================================================================
+        
         with t8:
             st.info("작업자 관리 및 DB 일괄 정화 도구입니다.")
             c_w1, c_w2 = st.columns(2)
