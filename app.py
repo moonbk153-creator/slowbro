@@ -584,6 +584,18 @@ def admin_menu_dialog():
                     st.error(f"적용 중 오류 발생: {e}")
                     
         with t5:
+            # =========================================================================
+            # [신규 추가] 현재 적용 중인 공지 목록 표기
+            # =========================================================================
+            if ACTIVE_NOTICES:
+                st.markdown("#### 📋 현재 적용 중인 공지 목록")
+                notice_list = [{"제품명": k, "공지 내용": v} for k, v in ACTIVE_NOTICES.items()]
+                st.dataframe(pd.DataFrame(notice_list), use_container_width=True, hide_index=True)
+                st.markdown("---")
+            else:
+                st.info("현재 활성화된 공지가 없습니다.")
+            # =========================================================================
+            
             np_prod = st.selectbox("제품", list(TARGET_DATA.keys()), key="admin_notice_prod")
             rn = get_raw_notice(np_prod)
             ntxt = st.text_area("내용", value=rn[0] if rn else "", key="admin_notice_text")
@@ -609,21 +621,32 @@ def admin_menu_dialog():
                 else: inact.append({"제품명":p, "최종 생산":"없음", "경과":"이력 없음"})
             st.dataframe(pd.DataFrame(inact), use_container_width=True, hide_index=True)
             
-        # =========================================================================
-        # [신규 추가] 통계 탭: 삭제된 작업자 이름 뒤에 (퇴사) 표시
-        # =========================================================================
         with t7:
+            # =========================================================================
+            # [기능 업데이트] 통계 탭 정렬 최적화 (현직자 -> 미입력(과거기록) -> 퇴사자 순 정렬)
+            # =========================================================================
             if not history_df.empty:
                 ws = []
                 for nm, grp in history_df.groupby('작업자'):
-                    # 현재 등록된 작업자 목록(CURRENT_WORKERS)에 없고, 기본값이 아니라면 (퇴사) 추가
-                    disp_nm = f"{nm} (퇴사)" if nm not in CURRENT_WORKERS and nm != '미입력(과거기록)' else nm
-                    
+                    # 분류 및 우선순위 설정
+                    if nm == '미입력(과거기록)':
+                        disp_nm = nm
+                        sort_prio = 1
+                    elif nm not in CURRENT_WORKERS:
+                        disp_nm = f"{nm} (퇴사)"
+                        sort_prio = 2
+                    else:
+                        disp_nm = nm
+                        sort_prio = 0
+                        
                     tc, fc = len(grp), len(grp[grp['판정'].str.contains("불합격", na=False)])
-                    ws.append({"작업자": disp_nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
-                st.dataframe(pd.DataFrame(ws).sort_values(by="총", ascending=False).style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
-        # =========================================================================
-        
+                    ws.append({"sort_prio": sort_prio, "작업자": disp_nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
+                
+                # 1순위: 작업상태(우선순위 값 정순), 2순위: 총 생산량(내림차순) 정렬 적용
+                stat_df = pd.DataFrame(ws).sort_values(by=["sort_prio", "총"], ascending=[True, False]).drop(columns=["sort_prio"])
+                st.dataframe(stat_df.style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
+            # =========================================================================
+
         with t8:
             st.info("작업자 관리 및 DB 일괄 정화 도구입니다.")
             c_w1, c_w2 = st.columns(2)
