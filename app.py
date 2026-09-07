@@ -86,7 +86,7 @@ def init_db():
         
         c.execute("SELECT count(*) FROM workers")
         if c.fetchone()[0] == 0:
-            for w in ["윤승태", "오세현", "조성윤", "이민형"]: c.execute("INSERT INTO workers (name) VALUES (?)", (w,))
+            for w in ["윤승태", "문지원", "조성윤", "이태원", "이민형"]: c.execute("INSERT INTO workers (name) VALUES (?)", (w,))
         
         c.execute("PRAGMA table_info(color_records)")
         cols = [info[1] for info in c.fetchall()]
