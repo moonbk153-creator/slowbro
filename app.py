@@ -28,7 +28,7 @@ if 'show_toast' in st.session_state:
     del st.session_state['show_toast']
 
 EXCEL_FILE, DB_FILE = 'data sheet.xlsx', 'color_management.db'
-EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
+EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 125kg"]
 ADMIN_PASSWORD, ACCESS_PASSWORD = st.secrets["ADMIN_PASSWORD"], st.secrets["APP_PASSWORD"]
 
 # ----------------------------------------------------
@@ -510,7 +510,7 @@ def admin_menu_dialog():
                                 if not p_dt: continue 
                                 
                                 pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
-                                am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "120" in eq else "-")
+                                am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "125" in eq else "-")
                                 rm = str(r.get('특이사항', '')).strip()
                                 tgt = get_historical_target(pd_name, p_dt)
                                 diff = round(meas - tgt, 1)
