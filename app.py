@@ -86,7 +86,7 @@ def init_db():
         
         c.execute("SELECT count(*) FROM workers")
         if c.fetchone()[0] == 0:
-            for w in ["윤승태", "문지원", "조성윤", "이태원", "이민형"]: c.execute("INSERT INTO workers (name) VALUES (?)", (w,))
+            for w in ["윤승태", "오세현", "조성윤", "이민형"]: c.execute("INSERT INTO workers (name) VALUES (?)", (w,))
         
         c.execute("PRAGMA table_info(color_records)")
         cols = [info[1] for info in c.fetchall()]
@@ -510,7 +510,7 @@ def admin_menu_dialog():
                                 if not p_dt: continue 
                                 
                                 pd_name, eq, wk = str(r['제품명']).strip(), str(r['생산설비']).strip(), str(r['작업자']).strip()
-                                am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "125" in eq else "-")
+                                am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "120" in eq else "-")
                                 rm = str(r.get('특이사항', '')).strip()
                                 tgt = get_historical_target(pd_name, p_dt)
                                 diff = round(meas - tgt, 1)
@@ -584,9 +584,6 @@ def admin_menu_dialog():
                     st.error(f"적용 중 오류 발생: {e}")
                     
         with t5:
-            # =========================================================================
-            # [신규 추가] 현재 적용 중인 공지 목록 표기
-            # =========================================================================
             if ACTIVE_NOTICES:
                 st.markdown("#### 📋 현재 적용 중인 공지 목록")
                 notice_list = [{"제품명": k, "공지 내용": v} for k, v in ACTIVE_NOTICES.items()]
@@ -594,7 +591,6 @@ def admin_menu_dialog():
                 st.markdown("---")
             else:
                 st.info("현재 활성화된 공지가 없습니다.")
-            # =========================================================================
             
             np_prod = st.selectbox("제품", list(TARGET_DATA.keys()), key="admin_notice_prod")
             rn = get_raw_notice(np_prod)
@@ -622,13 +618,9 @@ def admin_menu_dialog():
             st.dataframe(pd.DataFrame(inact), use_container_width=True, hide_index=True)
             
         with t7:
-            # =========================================================================
-            # [기능 업데이트] 통계 탭 정렬 최적화 (현직자 -> 미입력(과거기록) -> 퇴사자 순 정렬)
-            # =========================================================================
             if not history_df.empty:
                 ws = []
                 for nm, grp in history_df.groupby('작업자'):
-                    # 분류 및 우선순위 설정
                     if nm == '미입력(과거기록)':
                         disp_nm = nm
                         sort_prio = 1
@@ -642,10 +634,8 @@ def admin_menu_dialog():
                     tc, fc = len(grp), len(grp[grp['판정'].str.contains("불합격", na=False)])
                     ws.append({"sort_prio": sort_prio, "작업자": disp_nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 
-                # 1순위: 작업상태(우선순위 값 정순), 2순위: 총 생산량(내림차순) 정렬 적용
                 stat_df = pd.DataFrame(ws).sort_values(by=["sort_prio", "총"], ascending=[True, False]).drop(columns=["sort_prio"])
                 st.dataframe(stat_df.style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
-            # =========================================================================
 
         with t8:
             st.info("작업자 관리 및 DB 일괄 정화 도구입니다.")
@@ -863,11 +853,16 @@ if not ddf.empty:
     elif dm == "특정 일자": ddf = ddf[ddf['생산일'] == fd_str]
 
     if not ddf.empty:
+        # [정렬 정상화] 설비 묶음(버닝->태환...) + 시간 역순(최신 생산일 먼저) + 당일 내 먼저 생산한 제품 그룹 + 번호 정순
         eq_map = {'버닝': 0, '태환12kg': 1, '프로밧25kg': 2, '뷸러60kg': 3, '뷸러120kg': 4}
         ddf['s'] = ddf['생산설비'].astype(str).str.replace(" ", "").str.lower().map(lambda x: eq_map.get(x, 5))
         
-        ddf = ddf.sort_values(by=['s', '생산일', '고유번호'], ascending=[True, False, True])
-        ddf = ddf.drop(columns=['s'])
+        # [신규] 당일(생산일) & 설비 내에서 해당 제품이 '가장 먼저 등록된 고유번호'를 찾아 같은 제품끼리 묶어줌
+        ddf['prod_first_id'] = ddf.groupby(['s', '생산일', '제품명'])['고유번호'].transform('min')
+        
+        # 1.설비순 -> 2.최신날짜순 -> 3.먼저 입력된 제품그룹 -> 4.해당 제품 내 고유번호순(실제 시간순)
+        ddf = ddf.sort_values(by=['s', '생산일', 'prod_first_id', '고유번호'], ascending=[True, False, True, True])
+        ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
 if not ddf.empty:
     tb = len(ddf)
