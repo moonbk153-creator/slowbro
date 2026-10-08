@@ -869,16 +869,24 @@ def admin_menu_dialog():
     input_pw_admin = st.text_input("🔒 비밀번호를 입력하세요", type="password", key="admin_pw_input")
     
     if input_pw_admin == ADMIN_PASSWORD:
-        try:
-            st.download_button(
-                "💾 PostgreSQL 백업 다운로드",
-                make_database_backup(),
-                "color_management_backup.zip",
-                "application/zip",
-                key="admin_btn_backup",
-            )
-        except Exception as e:
-            st.warning(f"백업 파일을 만들지 못했습니다: {e}")
+        with st.expander("💾 PostgreSQL 백업", expanded=False):
+            st.caption("백업은 버튼을 눌렀을 때 생성합니다. 기록이 많으면 잠시 걸릴 수 있습니다.")
+            if st.button("백업 파일 준비 / 새로 만들기", key="admin_btn_prepare_backup"):
+                try:
+                    with st.spinner("Neon 기록을 백업 파일로 만들고 있습니다. 잠시 기다려주세요."):
+                        st.session_state["neon_backup_bytes"] = make_database_backup()
+                    st.success("백업 파일을 준비했습니다. 아래 버튼으로 컴퓨터에 저장하세요.")
+                except Exception as e:
+                    st.error(f"백업 파일을 만들지 못했습니다: {e}")
+
+            if st.session_state.get("neon_backup_bytes"):
+                st.download_button(
+                    "⬇️ 준비된 백업 파일 다운로드",
+                    st.session_state["neon_backup_bytes"],
+                    "color_management_backup.zip",
+                    "application/zip",
+                    key="admin_btn_download_backup",
+                )
         
         t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 데이터 정화", "🔮 AI 예측", "🗃️ SQLite 이전"])
         
@@ -999,6 +1007,14 @@ def admin_menu_dialog():
                             "UPDATE color_records SET id = ? WHERE id = ?",
                             [(new_id, -old_id) for new_id, old_id in enumerate(old_ids, start=1)]
                         )
+                        # 번호를 다시 매긴 뒤, 다음 새 기록이 겹치지 않도록 자동 번호도 맞춥니다.
+                        conn.execute(
+                            """SELECT setval(
+                                   pg_get_serial_sequence('color_records', 'id'),
+                                   COALESCE((SELECT MAX(id) FROM color_records), 1),
+                                   EXISTS(SELECT 1 FROM color_records)
+                               )"""
+                        )
                         conn.commit()
                         st.cache_data.clear()
                         st.session_state['show_toast'] = "고유번호 전면 재정렬 완료! 순서가 정상화되었습니다."
@@ -1099,12 +1115,20 @@ def admin_menu_dialog():
         with t6:
             inact = []
             td = get_now_kst().date()
+            latest_by_product = {}
+            if not history_df.empty:
+                latest_rows = history_df.drop_duplicates(subset=["제품명"], keep="first")
+                latest_by_product = {
+                    str(row["제품명"]): row
+                    for _, row in latest_rows.iterrows()
+                }
             for p in TARGET_DATA.keys():
-                lr = get_last_record(p)
-                if lr:
+                latest_row = latest_by_product.get(p)
+                if latest_row is not None:
                     try:
-                        d = (td - datetime.strptime(lr[0], "%Y-%m-%d").date()).days
-                        if d >= 120: inact.append({"제품명":p, "최종 생산":lr[0], "경과":f"{d}일"})
+                        last_date = safe_date_parse(latest_row["생산일"])
+                        d = (td - datetime.strptime(last_date, "%Y-%m-%d").date()).days
+                        if d >= 120: inact.append({"제품명":p, "최종 생산":last_date, "경과":f"{d}일"})
                     except: pass
                 else: inact.append({"제품명":p, "최종 생산":"없음", "경과":"이력 없음"})
             st.dataframe(pd.DataFrame(inact), use_container_width=True, hide_index=True)
