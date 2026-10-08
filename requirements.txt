@@ -5,3 +5,5 @@ pytz
 numpy
 streamlit-autorefresh
 holidays
+sqlalchemy
+psycopg2-binary
