@@ -1,11 +1,15 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+import tempfile
+import zipfile
 from datetime import datetime, timedelta
 import io 
 import pytz
 import numpy as np
 import re
+from pathlib import Path
+from sqlalchemy import create_engine, text
 
 KST = pytz.timezone('Asia/Seoul')
 
@@ -29,7 +33,7 @@ if 'show_toast' in st.session_state:
     st.toast(st.session_state['show_toast'], icon="✅")
     del st.session_state['show_toast']
 
-EXCEL_FILE, DB_FILE = 'data sheet.xlsx', 'color_management.db'
+EXCEL_FILE = 'data sheet.xlsx'
 EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
 ADMIN_PASSWORD, ACCESS_PASSWORD = st.secrets["ADMIN_PASSWORD"], st.secrets["APP_PASSWORD"]
 
@@ -61,62 +65,197 @@ def safe_date_parse(val):
     except: return v
 
 # ----------------------------------------------------
-# 2. DB 관리 및 보조 함수 (Lock 방지 적용)
-# ----------------------------------------------------
-def get_db_conn():
-    conn = sqlite3.connect(DB_FILE, timeout=20.0, check_same_thread=False)
+# 2. Neon PostgreSQL 데이터베이스
+# 화면 코드가 기존 방식으로 SQL을 부를 수 있도록 연결 도우미를 사용합니다.
+@st.cache_resource
+def get_db_engine():
     try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-    except:
-        pass
-    return conn
+        database_url = st.secrets["connections"]["neon"]["url"]
+    except Exception as e:
+        raise RuntimeError(
+            "Streamlit Secrets에 [connections.neon] 아래 url을 설정해야 합니다."
+        ) from e
+
+    if not str(database_url).startswith(("postgresql://", "postgresql+psycopg2://")):
+        raise RuntimeError("Neon 연결 주소는 postgresql:// 로 시작해야 합니다.")
+
+    return create_engine(
+        database_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+
+
+class DatabaseConnection:
+    """기존 화면의 execute/fetch/commit 코드를 PostgreSQL 연결로 이어줍니다."""
+
+    def __init__(self):
+        self.connection = get_db_engine().connect()
+
+    @staticmethod
+    def _prepare(sql, params=()):
+        sql = str(sql).strip()
+
+        # SQLite의 잠금 시작 명령을 PostgreSQL 트랜잭션 잠금으로 바꿉니다.
+        if sql.upper() == "BEGIN IMMEDIATE":
+            return None, None, True
+
+        # PostgreSQL은 INSERT OR IGNORE 대신 ON CONFLICT를 사용합니다.
+        sql = re.sub(
+            r"^INSERT\s+OR\s+IGNORE\s+INTO\s+",
+            "INSERT INTO ",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if "ON CONFLICT" not in sql.upper() and sql.upper().startswith("INSERT INTO EXCLUDED_PRODUCTS"):
+            sql += " ON CONFLICT (product_name) DO NOTHING"
+
+        # 물음표 자리를 SQLAlchemy가 이해하는 이름 있는 자리표시자로 바꿉니다.
+        if isinstance(params, dict):
+            return text(sql), params, False
+
+        values = tuple(params) if params is not None else ()
+        index = 0
+
+        def replace_placeholder(_match):
+            nonlocal index
+            placeholder = f":p{index}"
+            index += 1
+            return placeholder
+
+        converted_sql = re.sub(r"\?", replace_placeholder, sql)
+        if index != len(values):
+            raise ValueError("SQL 입력값 개수가 자리표시자 개수와 다릅니다.")
+        bind_values = {f"p{i}": value for i, value in enumerate(values)}
+        return text(converted_sql), bind_values, False
+
+    def execute(self, sql, params=()):
+        statement, bind_values, is_lock = self._prepare(sql, params)
+        if is_lock:
+            # 입력 저장이나 기준값 전체 교체가 동시에 실행되지 않게 짧게 잠급니다.
+            return self.connection.execute(
+                text("SELECT pg_advisory_xact_lock(893746221)")
+            )
+        return self.connection.execute(statement, bind_values)
+
+    def executemany(self, sql, rows):
+        rows = list(rows)
+        if not rows:
+            return None
+        statement, _, is_lock = self._prepare(sql, rows[0])
+        if is_lock:
+            self.execute("BEGIN IMMEDIATE")
+            return None
+
+        converted_rows = []
+        for row in rows:
+            _, bind_values, _ = self._prepare(sql, row)
+            converted_rows.append(bind_values)
+        return self.connection.execute(statement, converted_rows)
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type:
+            self.rollback()
+        self.close()
+
+
+def get_db_conn():
+    return DatabaseConnection()
+
 
 def init_db():
     conn = get_db_conn()
     try:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS color_records (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, production_date TEXT, equipment TEXT, worker TEXT, product_name TEXT, target_value REAL, measured_value REAL, difference REAL, status TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS target_history (id INTEGER PRIMARY KEY AUTOINCREMENT, product_name TEXT, target_value REAL, effective_date TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS product_notices (product_name TEXT PRIMARY KEY, notice_text TEXT, start_date TEXT, end_date TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS workers (name TEXT PRIMARY KEY)''')
-        
-        # 단종 제품 관리를 위한 신규 테이블
-        c.execute('''CREATE TABLE IF NOT EXISTS excluded_products (product_name TEXT PRIMARY KEY)''')
-        
-        c.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_target_hist ON target_history(product_name, effective_date)")
-        
-        c.execute("SELECT count(*) FROM workers")
-        if c.fetchone()[0] == 0:
-            for w in ["윤승태", "문지원", "조성윤", "이태원"]: c.execute("INSERT INTO workers (name) VALUES (?)", (w,))
-        
-        c.execute("PRAGMA table_info(color_records)")
-        cols = [info[1] for info in c.fetchall()]
-        if "remarks" not in cols: c.execute("ALTER TABLE color_records ADD COLUMN remarks TEXT DEFAULT ''")
-        if "input_amount" not in cols: c.execute("ALTER TABLE color_records ADD COLUMN input_amount TEXT DEFAULT '-'")
-        if "checked" not in cols: c.execute("ALTER TABLE color_records ADD COLUMN checked INTEGER DEFAULT 0")
+        conn.execute("""CREATE TABLE IF NOT EXISTS color_records (
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            timestamp TEXT,
+            production_date TEXT,
+            equipment TEXT,
+            worker TEXT,
+            product_name TEXT,
+            target_value DOUBLE PRECISION,
+            measured_value DOUBLE PRECISION,
+            difference DOUBLE PRECISION,
+            status TEXT,
+            remarks TEXT DEFAULT '',
+            input_amount TEXT DEFAULT '-',
+            checked INTEGER DEFAULT 0
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS target_history (
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            product_name TEXT,
+            target_value DOUBLE PRECISION,
+            effective_date TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS product_notices (
+            product_name TEXT PRIMARY KEY,
+            notice_text TEXT,
+            start_date TEXT,
+            end_date TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS workers (
+            name TEXT PRIMARY KEY
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS excluded_products (
+            product_name TEXT PRIMARY KEY
+        )""")
+
+        conn.execute("ALTER TABLE color_records ADD COLUMN IF NOT EXISTS remarks TEXT DEFAULT ''")
+        conn.execute("ALTER TABLE color_records ADD COLUMN IF NOT EXISTS input_amount TEXT DEFAULT '-'")
+        conn.execute("ALTER TABLE color_records ADD COLUMN IF NOT EXISTS checked INTEGER DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_target_hist ON target_history(product_name, effective_date)")
+
+        worker_count = conn.execute("SELECT COUNT(*) FROM workers").fetchone()[0]
+        if worker_count == 0:
+            conn.executemany(
+                "INSERT INTO workers (name) VALUES (?) ON CONFLICT (name) DO NOTHING",
+                [(w,) for w in ["윤승태", "문지원", "조성윤", "이태원"]],
+            )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
 
 def get_all_workers():
     conn = get_db_conn()
     try:
-        rows = conn.execute("SELECT name FROM workers").fetchall()
+        rows = conn.execute("SELECT name FROM workers ORDER BY name").fetchall()
         return [r[0] for r in rows]
     finally:
         conn.close()
 
+
 def add_worker(name):
     conn = get_db_conn()
-    try: 
-        conn.execute("INSERT INTO workers (name) VALUES (?)", (name.strip(),))
+    try:
+        result = conn.execute(
+            "INSERT INTO workers (name) VALUES (?) ON CONFLICT (name) DO NOTHING",
+            (name.strip(),),
+        )
         conn.commit()
-        return True
-    except: 
+        return result.rowcount > 0
+    except Exception:
+        conn.rollback()
         return False
-    finally: 
+    finally:
         conn.close()
+
 
 def delete_worker(name):
     conn = get_db_conn()
@@ -126,22 +265,27 @@ def delete_worker(name):
     finally:
         conn.close()
 
-# ---- 예측 제외(단종) 제품 관리 함수 ----
+
 def get_excluded_products():
     conn = get_db_conn()
     try:
-        rows = conn.execute("SELECT product_name FROM excluded_products").fetchall()
+        rows = conn.execute("SELECT product_name FROM excluded_products ORDER BY product_name").fetchall()
         return [r[0] for r in rows]
     finally:
         conn.close()
 
+
 def add_excluded_product(name):
     conn = get_db_conn()
     try:
-        conn.execute("INSERT OR IGNORE INTO excluded_products (product_name) VALUES (?)", (name.strip(),))
+        conn.execute("INSERT INTO excluded_products (product_name) VALUES (?)", (name.strip(),))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
 
 def remove_excluded_product(name):
     conn = get_db_conn()
@@ -150,81 +294,119 @@ def remove_excluded_product(name):
         conn.commit()
     finally:
         conn.close()
-# ---------------------------------------------
+
 
 def update_checked_status(record_ids, status_val):
     conn = get_db_conn()
     try:
-        for r in record_ids: conn.execute("UPDATE color_records SET checked=? WHERE id=?", (status_val, r))
+        for record_id in record_ids:
+            conn.execute("UPDATE color_records SET checked=? WHERE id=?", (status_val, record_id))
         conn.commit()
     finally:
         conn.close()
 
-def delete_from_db(r_id):
+
+def delete_from_db(record_id):
     conn = get_db_conn()
     try:
-        conn.execute("DELETE FROM color_records WHERE id = ?", (r_id,))
+        conn.execute("DELETE FROM color_records WHERE id = ?", (record_id,))
         conn.commit()
     finally:
         conn.close()
 
-def update_db(r_id, d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt, chk=0):
+
+def update_db(record_id, d_date, eq, wk, product, target, measured, diff, status, remarks, amount, checked=0):
     conn = get_db_conn()
     try:
-        conn.execute('UPDATE color_records SET production_date=?, equipment=?, worker=?, product_name=?, target_value=?, measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=? WHERE id=?', 
-                  (d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt, chk, r_id))
+        conn.execute(
+            """UPDATE color_records
+               SET production_date=?, equipment=?, worker=?, product_name=?, target_value=?,
+                   measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=?
+               WHERE id=?""",
+            (d_date, str(eq).strip(), str(wk).strip(), str(product).strip(), target,
+             measured, diff, status, remarks, amount, checked, record_id),
+        )
         conn.commit()
     finally:
         conn.close()
 
-def get_historical_target(p_name, d_str):
+
+def get_historical_target(product_name, date_text):
     conn = get_db_conn()
     try:
-        r = conn.execute('SELECT target_value FROM target_history WHERE product_name=? AND effective_date <= ? ORDER BY effective_date DESC, id DESC LIMIT 1', (p_name, d_str)).fetchone()
-        return r[0] if r else None
+        row = conn.execute(
+            """SELECT target_value FROM target_history
+               WHERE product_name=? AND effective_date <= ?
+               ORDER BY effective_date DESC, id DESC LIMIT 1""",
+            (product_name, date_text),
+        ).fetchone()
+        return row[0] if row else None
     finally:
         conn.close()
 
-def save_notice(p, txt, s_date, e_date):
+
+def save_notice(product, notice_text, start_date, end_date):
     conn = get_db_conn()
     try:
-        conn.execute('INSERT OR REPLACE INTO product_notices (product_name, notice_text, start_date, end_date) VALUES (?, ?, ?, ?)', (p, txt, s_date, e_date))
+        conn.execute(
+            """INSERT INTO product_notices (product_name, notice_text, start_date, end_date)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT (product_name) DO UPDATE SET
+                 notice_text=EXCLUDED.notice_text,
+                 start_date=EXCLUDED.start_date,
+                 end_date=EXCLUDED.end_date""",
+            (product, notice_text, start_date, end_date),
+        )
         conn.commit()
     finally:
         conn.close()
 
-def delete_notice(p):
+
+def delete_notice(product):
     conn = get_db_conn()
     try:
-        conn.execute("DELETE FROM product_notices WHERE product_name = ?", (p,))
+        conn.execute("DELETE FROM product_notices WHERE product_name = ?", (product,))
         conn.commit()
     finally:
         conn.close()
 
-def get_all_active_notices(t_str):
+
+def get_all_active_notices(date_text):
     conn = get_db_conn()
     try:
-        rows = conn.execute('SELECT product_name, notice_text FROM product_notices WHERE start_date <= ? AND end_date >= ?', (t_str, t_str)).fetchall()
+        rows = conn.execute(
+            "SELECT product_name, notice_text FROM product_notices WHERE start_date <= ? AND end_date >= ?",
+            (date_text, date_text),
+        ).fetchall()
         return {r[0]: r[1] for r in rows}
     finally:
         conn.close()
 
-def get_raw_notice(p):
+
+def get_raw_notice(product):
     conn = get_db_conn()
     try:
-        r = conn.execute("SELECT notice_text, start_date, end_date FROM product_notices WHERE product_name=?", (p,)).fetchone()
-        return r
+        return conn.execute(
+            "SELECT notice_text, start_date, end_date FROM product_notices WHERE product_name=?",
+            (product,),
+        ).fetchone()
     finally:
         conn.close()
 
-def _is_recent_duplicate(conn, d_date, eq, p, meas_val):
-    r = conn.execute('SELECT measured_value, timestamp FROM color_records WHERE production_date=? AND equipment=? AND product_name=? ORDER BY id DESC LIMIT 1', (d_date, str(eq).strip(), str(p).strip())).fetchone()
-    if not r or r[0] is None:
+
+def _is_recent_duplicate(conn, date_text, equipment, product, measured_value):
+    row = conn.execute(
+        """SELECT measured_value, timestamp FROM color_records
+           WHERE production_date=? AND equipment=? AND product_name=?
+           ORDER BY id DESC LIMIT 1""",
+        (date_text, str(equipment).strip(), str(product).strip()),
+    ).fetchone()
+    if not row or row[0] is None:
         return False
     try:
-        if float(r[0]) != float(meas_val):
+        if float(row[0]) != float(measured_value):
             return False
-        stored_at = datetime.fromisoformat(r[1])
+        stored_at = datetime.fromisoformat(row[1])
         if stored_at.tzinfo is None:
             stored_at = KST.localize(stored_at)
         else:
@@ -234,21 +416,25 @@ def _is_recent_duplicate(conn, d_date, eq, p, meas_val):
     except (TypeError, ValueError, OverflowError):
         return False
 
-def save_to_db(d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt):
+
+def save_to_db(date_text, equipment, worker, product, target, measured, difference, status, remarks, amount):
     conn = get_db_conn()
     try:
-        # 중복 확인과 저장을 한 번에 잠가, 여러 사용자가 동시에 입력해도 중복을 줄입니다.
         conn.execute("BEGIN IMMEDIATE")
-        if _is_recent_duplicate(conn, d_date, eq, p, meas):
+        if _is_recent_duplicate(conn, date_text, equipment, product, measured):
             conn.rollback()
             return False
 
-        ts = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                  (ts, d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt))
-
-        # 해당 제품이 예측 제외 목록에 있으면 생산 재개로 보고 자동 복구합니다.
-        conn.execute('DELETE FROM excluded_products WHERE product_name = ?', (str(p).strip(),))
+        timestamp = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            """INSERT INTO color_records
+               (timestamp, production_date, equipment, worker, product_name, target_value,
+                measured_value, difference, status, remarks, input_amount)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (timestamp, date_text, str(equipment).strip(), str(worker).strip(),
+             str(product).strip(), target, measured, difference, status, remarks, amount),
+        )
+        conn.execute("DELETE FROM excluded_products WHERE product_name = ?", (str(product).strip(),))
         conn.commit()
         return True
     except Exception:
@@ -257,33 +443,52 @@ def save_to_db(d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt):
     finally:
         conn.close()
 
-def check_recent_duplicate(d_date, eq, p, meas_val):
+
+def check_recent_duplicate(date_text, equipment, product, measured_value):
     conn = get_db_conn()
     try:
-        return _is_recent_duplicate(conn, d_date, eq, p, meas_val)
+        return _is_recent_duplicate(conn, date_text, equipment, product, measured_value)
     finally:
         conn.close()
 
-def get_last_record(p):
+
+def get_last_record(product):
     conn = get_db_conn()
     try:
-        r = conn.execute('SELECT production_date, measured_value, status FROM color_records WHERE product_name = ? ORDER BY production_date DESC, timestamp DESC LIMIT 1', (str(p).strip(),)).fetchone()
-        return r
+        return conn.execute(
+            """SELECT production_date, measured_value, status FROM color_records
+               WHERE product_name = ?
+               ORDER BY production_date DESC, timestamp DESC LIMIT 1""",
+            (str(product).strip(),),
+        ).fetchone()
     finally:
         conn.close()
 
-def get_equipment_last_records(p_name):
+
+def get_equipment_last_records(product_name):
     conn = get_db_conn()
     try:
         query = """
-            WITH RankedRecords AS (SELECT equipment, production_date, measured_value, status, id, ROW_NUMBER() OVER (PARTITION BY equipment ORDER BY production_date DESC, timestamp DESC, id DESC) as rn FROM color_records WHERE product_name = ?), 
-            EquipCounts AS (SELECT equipment, COUNT(*) as cnt FROM color_records WHERE product_name = ? GROUP BY equipment)
-            SELECT r.equipment, r.production_date, r.measured_value, r.status, c.cnt FROM RankedRecords r JOIN EquipCounts c ON r.equipment = c.equipment WHERE r.rn = 1 ORDER BY c.cnt DESC, r.production_date DESC
+            WITH RankedRecords AS (
+                SELECT equipment, production_date, measured_value, status, id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY equipment
+                           ORDER BY production_date DESC, timestamp DESC, id DESC
+                       ) AS rn
+                FROM color_records WHERE product_name = ?
+            ),
+            EquipCounts AS (
+                SELECT equipment, COUNT(*) AS cnt
+                FROM color_records WHERE product_name = ? GROUP BY equipment
+            )
+            SELECT r.equipment, r.production_date, r.measured_value, r.status, c.cnt
+            FROM RankedRecords r JOIN EquipCounts c ON r.equipment = c.equipment
+            WHERE r.rn = 1 ORDER BY c.cnt DESC, r.production_date DESC
         """
-        rows = conn.execute(query, (str(p_name).strip(), str(p_name).strip())).fetchall()
-        return rows
+        return conn.execute(query, (str(product_name).strip(), str(product_name).strip())).fetchall()
     finally:
         conn.close()
+
 
 def auto_fill_input_amount(row):
     eq = str(row['생산설비']).lower().replace(" ", "")
@@ -312,7 +517,7 @@ def load_from_db():
             ) as 기준색도
         FROM color_records c
         """
-        try: df = pd.read_sql_query(q, conn)
+        try: df = pd.read_sql_query(q, conn.connection)
         except Exception: 
             return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
 
@@ -344,7 +549,7 @@ def load_from_db():
         # 내부 연산용 시간 역순 정렬 (최신이 상단, 과거가 하단)
         df = df.sort_values(by=['생산일', '입력일시', '고유번호'], ascending=[False, False, False]).reset_index(drop=True)
 
-        th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn)
+        th_df = pd.read_sql_query("SELECT product_name, effective_date FROM target_history WHERE effective_date NOT IN ('2000-01-01', '2024-04-11', '')", conn.connection)
         target_change_first_ids = set()
         for _, r in th_df.iterrows():
             sub = df[(df['제품명'] == r['product_name'].strip()) & (df['생산일'] >= r['effective_date'])]
@@ -415,13 +620,207 @@ def get_ai_predictions(today_str):
         })
     return predict_data
 
+def make_database_backup():
+    """Neon의 표 5개를 CSV로 묶어 내려받을 수 있게 합니다."""
+    tables = ["color_records", "target_history", "product_notices", "workers", "excluded_products"]
+    memory_file = io.BytesIO()
+    with zipfile.ZipFile(memory_file, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        conn = get_db_conn()
+        try:
+            for table in tables:
+                df = pd.read_sql_query(
+                    f"SELECT * FROM {table}",
+                    conn.connection,
+                )
+                archive.writestr(f"{table}.csv", df.to_csv(index=False).encode("utf-8-sig"))
+        finally:
+            conn.close()
+    memory_file.seek(0)
+    return memory_file.getvalue()
+
+
+def migrate_sqlite_database(uploaded_file):
+    """예전 앱에서 내려받은 SQLite 백업을 빈 Neon 데이터베이스로 옮깁니다."""
+    temp_path = None
+    source = None
+    conn = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as temp_file:
+            temp_file.write(uploaded_file.getvalue())
+            temp_path = temp_file.name
+
+        source = sqlite3.connect(temp_path)
+        source.row_factory = sqlite3.Row
+        available_tables = {
+            row["name"]
+            for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "color_records" not in available_tables:
+            raise ValueError("올린 파일 안에 color_records 기록표가 없습니다.")
+
+        def read_table(table_name):
+            if table_name not in available_tables:
+                return [], []
+            columns = [row["name"] for row in source.execute(f"PRAGMA table_info({table_name})")]
+            rows = [dict(row) for row in source.execute(f"SELECT * FROM {table_name}")]
+            return columns, rows
+
+        record_columns, records = read_table("color_records")
+        required_columns = {"production_date", "equipment", "worker", "product_name", "measured_value"}
+        if not required_columns.issubset(set(record_columns)):
+            missing = ", ".join(sorted(required_columns - set(record_columns)))
+            raise ValueError(f"color_records에 필요한 열이 없습니다: {missing}")
+
+        target_columns, targets = read_table("target_history")
+        _, notices = read_table("product_notices")
+        _, workers = read_table("workers")
+        _, excluded = read_table("excluded_products")
+
+        conn = get_db_conn()
+        existing_count = conn.execute("SELECT COUNT(*) FROM color_records").fetchone()[0]
+        if existing_count:
+            raise ValueError(
+                "Neon에 이미 생산 기록이 있어 중복 이관을 막았습니다. "
+                "기록을 덮어쓰지 않도록 이관은 color_records가 비어 있을 때만 가능합니다."
+            )
+
+        conn.execute("BEGIN IMMEDIATE")
+        # init_db/load_tgt가 만든 초기 작업자와 엑셀 기준값을 예전 DB 내용으로 교체합니다.
+        conn.execute("DELETE FROM target_history")
+        conn.execute("DELETE FROM product_notices")
+        conn.execute("DELETE FROM workers")
+        conn.execute("DELETE FROM excluded_products")
+
+        record_fields = [
+            "id", "timestamp", "production_date", "equipment", "worker", "product_name",
+            "target_value", "measured_value", "difference", "status", "remarks", "input_amount", "checked",
+        ]
+        record_rows = []
+        for row in records:
+            values = dict(row)
+            values.setdefault("timestamp", "")
+            values.setdefault("target_value", None)
+            values.setdefault("difference", None)
+            values.setdefault("status", "")
+            values.setdefault("remarks", "")
+            values.setdefault("input_amount", "-")
+            values.setdefault("checked", 0)
+            record_rows.append(tuple(values.get(field) for field in record_fields))
+        if record_rows:
+            conn.executemany(
+                """INSERT INTO color_records
+                   (id, timestamp, production_date, equipment, worker, product_name, target_value,
+                    measured_value, difference, status, remarks, input_amount, checked)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (id) DO NOTHING""",
+                record_rows,
+            )
+
+        target_rows = []
+        for row in targets:
+            if {"product_name", "target_value", "effective_date"}.issubset(row):
+                target_rows.append((
+                    row.get("id"),
+                    row.get("product_name"),
+                    row.get("target_value"),
+                    row.get("effective_date"),
+                ))
+        if target_rows:
+            if "id" in target_columns:
+                conn.executemany(
+                    """INSERT INTO target_history (id, product_name, target_value, effective_date)
+                       VALUES (?, ?, ?, ?)""",
+                    target_rows,
+                )
+            else:
+                conn.executemany(
+                    """INSERT INTO target_history (product_name, target_value, effective_date)
+                       VALUES (?, ?, ?)""",
+                    [row[1:] for row in target_rows],
+                )
+
+        notice_rows = [
+            (row.get("product_name"), row.get("notice_text"), row.get("start_date"), row.get("end_date"))
+            for row in notices if row.get("product_name")
+        ]
+        if notice_rows:
+            conn.executemany(
+                """INSERT INTO product_notices (product_name, notice_text, start_date, end_date)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT (product_name) DO UPDATE SET
+                     notice_text=EXCLUDED.notice_text,
+                     start_date=EXCLUDED.start_date,
+                     end_date=EXCLUDED.end_date""",
+                notice_rows,
+            )
+
+        worker_rows = [(row.get("name"),) for row in workers if row.get("name")]
+        if not worker_rows:
+            worker_rows = [(name,) for name in ["윤승태", "문지원", "조성윤", "이태원"]]
+        if worker_rows:
+            conn.executemany(
+                "INSERT INTO workers (name) VALUES (?) ON CONFLICT (name) DO NOTHING",
+                worker_rows,
+            )
+
+        excluded_rows = [
+            (row.get("product_name"),)
+            for row in excluded if row.get("product_name")
+        ]
+        if excluded_rows:
+            conn.executemany(
+                "INSERT INTO excluded_products (product_name) VALUES (?) ON CONFLICT (product_name) DO NOTHING",
+                excluded_rows,
+            )
+
+        # 가져온 예전 번호 다음부터 새 번호를 만들도록 자동 번호 값을 맞춥니다.
+        conn.execute(
+            """SELECT setval(
+                   pg_get_serial_sequence('color_records', 'id'),
+                   COALESCE((SELECT MAX(id) FROM color_records), 1),
+                   EXISTS(SELECT 1 FROM color_records)
+               )"""
+        )
+        conn.execute(
+            """SELECT setval(
+                   pg_get_serial_sequence('target_history', 'id'),
+                   COALESCE((SELECT MAX(id) FROM target_history), 1),
+                   EXISTS(SELECT 1 FROM target_history)
+               )"""
+        )
+        conn.commit()
+        return len(records), len(target_rows)
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+        if source is not None:
+            source.close()
+        if temp_path and Path(temp_path).exists():
+            Path(temp_path).unlink()
+
+
 @st.cache_data
 def to_excel(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as w: df.to_excel(w, index=False, sheet_name='기록')
     return output.getvalue()
 
-init_db() 
+# Neon 연결을 확인하고 필요한 표를 준비합니다.
+try:
+    init_db()
+    check_conn = get_db_conn()
+    check_conn.execute("SELECT 1")
+    check_conn.close()
+except Exception as e:
+    st.title("🛑 Neon 데이터베이스에 연결할 수 없습니다")
+    st.error("Streamlit Secrets의 Neon 연결 주소와 requirements.txt 설정을 확인해주세요.")
+    st.caption(f"{type(e).__name__}: {e}")
+    st.stop()
+
 CURRENT_WORKERS = get_all_workers()
 
 @st.cache_data
@@ -456,10 +855,18 @@ def admin_menu_dialog():
     input_pw_admin = st.text_input("🔒 비밀번호를 입력하세요", type="password", key="admin_pw_input")
     
     if input_pw_admin == ADMIN_PASSWORD:
-        try: st.download_button("💾 DB 백업 다운로드", open(DB_FILE, "rb").read(), "color_management.db", "application/octet-stream", key="admin_btn_backup")
-        except: pass
+        try:
+            st.download_button(
+                "💾 PostgreSQL 백업 다운로드",
+                make_database_backup(),
+                "color_management_backup.zip",
+                "application/zip",
+                key="admin_btn_backup",
+            )
+        except Exception as e:
+            st.warning(f"백업 파일을 만들지 못했습니다: {e}")
         
-        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 데이터 정화", "🔮 AI 예측"])
+        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["🔍 금일 확인", "📝 수정/삭제", "📂 과거기록 업로드", "📅 제품기준 적용", "📢 공지", "⏳ 미생산", "👥 통계", "🧑‍🔧 데이터 정화", "🔮 AI 예측", "🗃️ SQLite 이전"])
         
         with t1:
             st.info("오늘 생산된 배치 확인 관리")
@@ -488,9 +895,12 @@ def admin_menu_dialog():
                 elif act == "수정":
                     conn = get_db_conn()
                     try:
-                        cols = [i[1] for i in conn.execute("PRAGMA table_info(color_records)").fetchall()]
-                        chk_c = "checked" if "checked" in cols else "0"
-                        row = conn.execute(f"SELECT product_name, target_value, production_date, equipment, worker, measured_value, remarks, input_amount, COALESCE({chk_c}, 0) FROM color_records WHERE id=?", (tid,)).fetchone()
+                        row = conn.execute(
+                            """SELECT product_name, target_value, production_date, equipment, worker,
+                                      measured_value, remarks, input_amount, COALESCE(checked, 0)
+                               FROM color_records WHERE id=?""",
+                            (tid,),
+                        ).fetchone()
                     finally:
                         conn.close()
                         
@@ -751,6 +1161,37 @@ def admin_menu_dialog():
                 st.session_state['show_toast'] = "125kg 일괄 변경 완료!"
                 st.rerun()
                 
+        with t10:
+            st.info("예전 앱의 SQLite 백업 파일을 Neon PostgreSQL로 한 번 옮기는 메뉴입니다.")
+            st.warning(
+                "먼저 기존 앱의 관리자 메뉴에서 color_management.db 백업을 내려받아 두세요. "
+                "새 앱을 배포한 뒤에는 아래에서 그 .db 파일을 올려 이관합니다."
+            )
+            st.caption(
+                "이 기능은 Neon에 생산 기록이 하나도 없을 때만 실행됩니다. "
+                "이미 Neon에 저장된 생산 기록은 덮어쓰지 않습니다."
+            )
+            sqlite_upload = st.file_uploader(
+                "예전 앱에서 받은 SQLite 백업 파일(.db)",
+                type=["db", "sqlite", "sqlite3"],
+                key="admin_sqlite_migration_file",
+            )
+            if sqlite_upload and st.button(
+                "SQLite 기록을 Neon으로 옮기기",
+                type="primary",
+                key="admin_btn_sqlite_migration",
+            ):
+                try:
+                    with st.spinner("기록을 옮기는 중입니다. 창을 닫지 마세요."):
+                        moved_records, moved_targets = migrate_sqlite_database(sqlite_upload)
+                    st.cache_data.clear()
+                    st.session_state["show_toast"] = (
+                        f"이관 완료: 생산 기록 {moved_records:,}건, 기준값 이력 {moved_targets:,}건"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"이관하지 못했습니다: {e}")
+
         with t9:
             st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품의 생산 간격 중간값을 이용한 영업일 예측")
             
