@@ -1176,10 +1176,12 @@ def admin_menu_dialog():
                 type=["db", "sqlite", "sqlite3"],
                 key="admin_sqlite_migration_file",
             )
-            if sqlite_upload and st.button(
+            st.caption("먼저 위에서 .db 파일을 선택하세요. 파일을 선택하기 전에는 아래 버튼이 비활성화됩니다.")
+            if st.button(
                 "SQLite 기록을 Neon으로 옮기기",
                 type="primary",
                 key="admin_btn_sqlite_migration",
+                disabled=sqlite_upload is None,
             ):
                 try:
                     with st.spinner("기록을 옮기는 중입니다. 창을 닫지 마세요."):
