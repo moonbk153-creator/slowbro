@@ -7,11 +7,14 @@ import pytz
 import numpy as np
 import re
 
+KST = pytz.timezone('Asia/Seoul')
+
 # [최적화] 공휴일 로드 및 오류 방지
 try:
     import holidays
     HAS_HOLIDAYS = True
-    kr_holidays_dict = holidays.KR(years=range(2020, 2035))
+    holiday_end_year = datetime.now(KST).year + 10
+    kr_holidays_dict = holidays.KR(years=range(2000, holiday_end_year + 1))
     KR_HOLIDAYS = [str(date) for date in kr_holidays_dict.keys()]
 except ImportError:
     HAS_HOLIDAYS = False
@@ -20,7 +23,6 @@ except ImportError:
 try: from streamlit_autorefresh import st_autorefresh
 except ImportError: st_autorefresh = None
 
-KST = pytz.timezone('Asia/Seoul')
 st.set_page_config(page_title="색도 관리 시스템", layout="wide")
 
 if 'show_toast' in st.session_state:
@@ -179,7 +181,7 @@ def get_historical_target(p_name, d_str):
     conn = get_db_conn()
     try:
         r = conn.execute('SELECT target_value FROM target_history WHERE product_name=? AND effective_date <= ? ORDER BY effective_date DESC, id DESC LIMIT 1', (p_name, d_str)).fetchone()
-        return r[0] if r else TARGET_DATA.get(p_name, 0.0)
+        return r[0] if r else None
     finally:
         conn.close()
 
@@ -215,30 +217,50 @@ def get_raw_notice(p):
     finally:
         conn.close()
 
+def _is_recent_duplicate(conn, d_date, eq, p, meas_val):
+    r = conn.execute('SELECT measured_value, timestamp FROM color_records WHERE production_date=? AND equipment=? AND product_name=? ORDER BY id DESC LIMIT 1', (d_date, str(eq).strip(), str(p).strip())).fetchone()
+    if not r or r[0] is None:
+        return False
+    try:
+        if float(r[0]) != float(meas_val):
+            return False
+        stored_at = datetime.fromisoformat(r[1])
+        if stored_at.tzinfo is None:
+            stored_at = KST.localize(stored_at)
+        else:
+            stored_at = stored_at.astimezone(KST)
+        age_seconds = (get_now_kst() - stored_at).total_seconds()
+        return 0 <= age_seconds < 30
+    except (TypeError, ValueError, OverflowError):
+        return False
+
 def save_to_db(d_date, eq, wk, p, tgt, meas, diff, st_val, rmks, amt):
-    ts = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db_conn()
     try:
-        # 데이터 등록
-        conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 
+        # 중복 확인과 저장을 한 번에 잠가, 여러 사용자가 동시에 입력해도 중복을 줄입니다.
+        conn.execute("BEGIN IMMEDIATE")
+        if _is_recent_duplicate(conn, d_date, eq, p, meas):
+            conn.rollback()
+            return False
+
+        ts = get_now_kst().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                   (ts, d_date, str(eq).strip(), str(wk).strip(), str(p).strip(), tgt, meas, diff, st_val, rmks, amt))
-        
-        # [자동 해제 로직] 해당 제품이 단종(예측 제외) 목록에 있다면 자동으로 삭제하여 복구시킴
+
+        # 해당 제품이 예측 제외 목록에 있으면 생산 재개로 보고 자동 복구합니다.
         conn.execute('DELETE FROM excluded_products WHERE product_name = ?', (str(p).strip(),))
-        
         conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 def check_recent_duplicate(d_date, eq, p, meas_val):
     conn = get_db_conn()
     try:
-        r = conn.execute('SELECT measured_value, timestamp FROM color_records WHERE production_date=? AND equipment=? AND product_name=? ORDER BY id DESC LIMIT 1', (d_date, str(eq).strip(), str(p).strip())).fetchone()
-        if r and float(r[0]) == float(meas_val):
-            try:
-                if (get_now_kst() - datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")).total_seconds() < 30: return True 
-            except: pass
-        return False
+        return _is_recent_duplicate(conn, d_date, eq, p, meas_val)
     finally:
         conn.close()
 
@@ -285,10 +307,9 @@ def load_from_db():
             c.worker as 작업자, c.product_name as 제품명, c.measured_value as 측정색도, 
             COALESCE(c.remarks, '') as 특이사항, COALESCE(c.checked, 0) as checked_status, 
             COALESCE(
-                (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name AND th.effective_date <= c.production_date ORDER BY th.effective_date DESC LIMIT 1), 
-                (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name ORDER BY th.effective_date ASC LIMIT 1), 
-                0.0
-            ) as 기준색도 
+                (SELECT target_value FROM target_history th WHERE th.product_name = c.product_name AND th.effective_date <= c.production_date ORDER BY th.effective_date DESC, th.id DESC LIMIT 1),
+                c.target_value
+            ) as 기준색도
         FROM color_records c
         """
         try: df = pd.read_sql_query(q, conn)
@@ -311,6 +332,7 @@ def load_from_db():
         df['판정'] = "합격 🟢"
         df.loc[df['오차'].abs() > 2.0, '판정'] = "불합격 🔴"
         df.loc[df['오차'].isna(), '판정'] = "오류"
+        df.loc[df['기준색도'].isna(), '판정'] = "기준 없음 ⚪"
         
         # 가짜 태그 흔적 텍스트 완벽 정화(정규식)
         df['특이사항'] = df['특이사항'].fillna('').astype(str)
@@ -350,14 +372,16 @@ def load_from_db():
     finally:
         conn.close()
 
-@st.cache_data(show_spinner=False)
-def get_ai_predictions():
+@st.cache_data(show_spinner=False, ttl=600)
+def get_ai_predictions(today_str):
+    if not HAS_HOLIDAYS:
+        return []
     df = load_from_db()
     if df.empty: return []
     
     excluded_products = get_excluded_products()
     predict_data = []
-    today_d = get_now_kst().date()
+    today_d = datetime.strptime(today_str, "%Y-%m-%d").date()
     df['생산일_dt'] = pd.to_datetime(df['생산일'], errors='coerce').dt.date
     
     for prod, group in df.groupby('제품명'):
@@ -365,17 +389,17 @@ def get_ai_predictions():
         if prod in excluded_products: 
             continue
             
-        unique_dates = sorted(group['생산일_dt'].dropna().drop_duplicates().tolist())
-        if len(unique_dates) < 2: continue
-        
-        last_date = unique_dates[-1]
-        if (today_d - last_date).days > 120: continue 
-        
-        intervals = [int(np.busday_count(str(unique_dates[i-1]), str(unique_dates[i]), holidays=KR_HOLIDAYS)) for i in range(1, len(unique_dates))]
+        unique_dates = sorted(d for d in group['생산일_dt'].dropna().drop_duplicates().tolist() if d <= today_d)
+        recent_dates = [d for d in unique_dates if (today_d - d).days <= 120]
+        if len(recent_dates) < 2: continue
+
+        last_date = recent_dates[-1]
+        intervals = [int(np.busday_count(str(recent_dates[i-1]), str(recent_dates[i]), holidays=KR_HOLIDAYS)) for i in range(1, len(recent_dates))]
         if not intervals: continue
-        avg_interval = max(1, sum(intervals) / len(intervals))
+        # 최근 120일의 간격 중앙값을 사용해 오래된 공백이나 한 번의 큰 지연 영향을 줄입니다.
+        avg_interval = max(1, float(np.median(intervals)))
         
-        next_date_np = np.busday_offset(str(last_date), int(avg_interval), roll='forward', holidays=KR_HOLIDAYS)
+        next_date_np = np.busday_offset(str(last_date), int(np.floor(avg_interval + 0.5)), roll='forward', holidays=KR_HOLIDAYS)
         next_date = pd.to_datetime(next_date_np).date()
         d_day = int(np.busday_count(str(today_d), str(next_date), holidays=KR_HOLIDAYS))
         
@@ -386,7 +410,7 @@ def get_ai_predictions():
         
         predict_data.append({
             "제품명": prod, "마지막 생산일": last_date.strftime("%Y-%m-%d"),
-            "평균 생산 주기": f"약 {int(avg_interval)}영업일", "다음 예상일": next_date.strftime("%Y-%m-%d"),
+            "최근 생산 주기(중앙값)": f"약 {int(np.floor(avg_interval + 0.5))}영업일", "다음 예상일": next_date.strftime("%Y-%m-%d"),
             "생산 필요 상태": status_str, "_sort": d_day
         })
     return predict_data
@@ -487,10 +511,13 @@ def admin_menu_dialog():
                         
                         if st.button("✏️ 수정 완료", key="admin_btn_edit_record"):
                             tgt = get_historical_target(nprod, npd)
-                            diff = round(nm - tgt, 1)
-                            stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
-                            update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8])
-                            st.cache_data.clear(); st.session_state['show_toast'] = "수정됨!"; st.rerun()
+                            if tgt is None:
+                                st.error("선택한 날짜에 적용되는 기준값이 없어 수정할 수 없습니다. 기준 이력을 먼저 등록해주세요.")
+                            else:
+                                diff = round(nm - tgt, 1)
+                                stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
+                                update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8])
+                                st.cache_data.clear(); st.session_state['show_toast'] = "수정됨!"; st.rerun()
         
         with t3:
             st.info("과거 생산/측정 기록이 담긴 엑셀 데이터를 일괄 업로드합니다.")
@@ -513,8 +540,8 @@ def admin_menu_dialog():
                                 am = str(r.get('투입량', '')).strip() if '버닝' in eq.lower() else ("12kg" if "태환" in eq else "25kg" if "프로밧" in eq else "60kg" if "60" in eq else "125kg" if "120" in eq else "-")
                                 rm = str(r.get('특이사항', '')).strip()
                                 tgt = get_historical_target(pd_name, p_dt)
-                                diff = round(meas - tgt, 1)
-                                stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
+                                diff = round(meas - tgt, 1) if tgt is not None else None
+                                stat = ("합격 🟢" if abs(diff)<=2.0 else "불합격 🔴") if diff is not None else "기준 없음 ⚪"
                                 
                                 # DB 입력
                                 conn.execute('INSERT INTO color_records (timestamp, production_date, equipment, worker, product_name, target_value, measured_value, difference, status, remarks, input_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (get_now_kst().strftime("%Y-%m-%d %H:%M:%S"), p_dt, eq, wk, pd_name, tgt, meas, diff, stat, rm if rm not in ['nan','None'] else '', am))
@@ -536,24 +563,24 @@ def admin_menu_dialog():
             if st.button("🧹 고유번호 날짜순 전면 재정렬", type="primary", key="admin_btn_reindex"):
                 conn = get_db_conn()
                 try:
-                    df_all = pd.read_sql_query("SELECT * FROM color_records", conn)
-                    if not df_all.empty:
-                        df_all = df_all.sort_values(by=['production_date', 'id'], ascending=[True, True]).reset_index(drop=True)
-                        df_all['id'] = df_all.index + 1
-                        
-                        conn.execute("DROP TABLE color_records")
-                        conn.execute('''CREATE TABLE color_records (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, production_date TEXT, equipment TEXT, worker TEXT, product_name TEXT, target_value REAL, measured_value REAL, difference REAL, status TEXT, remarks TEXT DEFAULT '', input_amount TEXT DEFAULT '-', checked INTEGER DEFAULT 0)''')
-                        conn.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
-                        
-                        df_all.to_sql('color_records', conn, if_exists='append', index=False)
+                    conn.execute("BEGIN IMMEDIATE")
+                    old_ids = [r[0] for r in conn.execute("SELECT id FROM color_records ORDER BY production_date ASC, id ASC").fetchall()]
+                    if not old_ids:
+                        conn.rollback()
+                        st.info("데이터가 없습니다.")
+                    else:
+                        # 기존 테이블을 삭제하지 않고, 한 트랜잭션 안에서 번호만 바꿉니다.
+                        conn.execute("UPDATE color_records SET id = -id")
+                        conn.executemany(
+                            "UPDATE color_records SET id = ? WHERE id = ?",
+                            [(new_id, -old_id) for new_id, old_id in enumerate(old_ids, start=1)]
+                        )
                         conn.commit()
-                        
                         st.cache_data.clear()
                         st.session_state['show_toast'] = "고유번호 전면 재정렬 완료! 순서가 정상화되었습니다."
                         st.rerun()
-                    else:
-                        st.info("데이터가 없습니다.")
                 except Exception as e:
+                    conn.rollback()
                     st.error(f"재정렬 중 오류 발생: {e}")
                 finally:
                     conn.close()
@@ -565,19 +592,60 @@ def admin_menu_dialog():
                 try:
                     df_h = pd.read_excel(h_up)
                     if all(c in df_h.columns for c in ['제품명','적용시작일','기준색도']):
-                        conn = get_db_conn()
-                        try:
-                            conn.execute("DELETE FROM target_history")
-                            for _, r in df_h.iterrows():
-                                dt = safe_date_parse(r['적용시작일']) or '2000-01-01'
-                                try: conn.execute("INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)", (str(r['제품명']).strip(), float(r['기준색도']), dt))
-                                except: pass
-                            conn.commit()
-                        finally:
-                            conn.close()
-                        st.cache_data.clear(); 
-                        st.session_state['show_toast'] = "제품 기준값이 시스템 전체에 즉시 적용되었습니다!"
-                        st.rerun()
+                        prepared_rows = []
+                        validation_errors = []
+                        seen_keys = set()
+                        for row_num, (_, r) in enumerate(df_h.iterrows(), start=2):
+                            product = str(r['제품명']).strip()
+                            if product.lower() in ('', 'nan', 'none'):
+                                validation_errors.append(f"{row_num}행: 제품명이 비어 있습니다.")
+                                continue
+
+                            date_text = safe_date_parse(r['적용시작일'])
+                            try:
+                                effective_date = datetime.strptime(date_text, "%Y-%m-%d").strftime("%Y-%m-%d")
+                            except (TypeError, ValueError):
+                                validation_errors.append(f"{row_num}행: 적용시작일을 날짜로 읽을 수 없습니다.")
+                                continue
+
+                            try:
+                                target = float(r['기준색도'])
+                                if not np.isfinite(target):
+                                    raise ValueError("숫자가 아닙니다")
+                            except (TypeError, ValueError):
+                                validation_errors.append(f"{row_num}행: 기준색도는 유효한 숫자여야 합니다.")
+                                continue
+
+                            key = (product, effective_date)
+                            if key in seen_keys:
+                                validation_errors.append(f"{row_num}행: 같은 제품과 적용일이 중복됩니다.")
+                                continue
+                            seen_keys.add(key)
+                            prepared_rows.append((product, target, effective_date))
+
+                        if not prepared_rows:
+                            validation_errors.append("적용할 기준값 행이 없습니다.")
+
+                        if validation_errors:
+                            st.error("기준값을 적용하지 않았습니다. 파일을 수정한 뒤 다시 올려주세요.\n\n" + "\n".join(validation_errors[:10]))
+                        else:
+                            conn = get_db_conn()
+                            try:
+                                conn.execute("BEGIN IMMEDIATE")
+                                conn.execute("DELETE FROM target_history")
+                                conn.executemany(
+                                    "INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)",
+                                    prepared_rows
+                                )
+                                conn.commit()
+                            except Exception:
+                                conn.rollback()
+                                raise
+                            finally:
+                                conn.close()
+                            st.cache_data.clear()
+                            st.session_state['show_toast'] = "제품 기준값이 시스템 전체에 즉시 적용되었습니다!"
+                            st.rerun()
                     else:
                         st.error("엑셀 파일에 '제품명', '적용시작일', '기준색도' 열이 포함되어 있어야 합니다.")
                 except Exception as e:
@@ -631,8 +699,12 @@ def admin_menu_dialog():
                         disp_nm = nm
                         sort_prio = 0
                         
-                    tc, fc = len(grp), len(grp[grp['판정'].str.contains("불합격", na=False)])
-                    ws.append({"sort_prio": sort_prio, "작업자": disp_nm, "총":tc, "합격":tc-fc, "불합격":fc, "불량률(%)":fc/tc*100 if tc>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
+                    tc = len(grp)
+                    pc = int(grp['판정'].eq("합격 🟢").sum())
+                    fc = int(grp['판정'].eq("불합격 🔴").sum())
+                    unknown = tc - pc - fc
+                    known_count = pc + fc
+                    ws.append({"sort_prio": sort_prio, "작업자": disp_nm, "총":tc, "합격":pc, "불합격":fc, "미판정":unknown, "불량률(%)":fc/known_count*100 if known_count>0 else 0, "오차(절대)":grp['오차'].abs().mean()})
                 
                 stat_df = pd.DataFrame(ws).sort_values(by=["sort_prio", "총"], ascending=[True, False]).drop(columns=["sort_prio"])
                 st.dataframe(stat_df.style.format({"불량률(%)":"{:.1f}%", "오차(절대)":"{:.2f}"}), hide_index=True)
@@ -680,7 +752,7 @@ def admin_menu_dialog():
                 st.rerun()
                 
         with t9:
-            st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품들의 영업일 기준 평균 생산 주기 분석")
+            st.info("최근 4개월(120일) 이내에 2회 이상 생산된 제품의 생산 간격 중간값을 이용한 영업일 예측")
             
             with st.expander("🚫 단종/생산종료 제품 예측 제외 관리", expanded=False):
                 st.caption("계약 종료 등으로 더 이상 생산하지 않는 제품을 AI 예측 목록에서 숨깁니다. (생산 재개 시 자동으로 복구됩니다.)")
@@ -709,19 +781,22 @@ def admin_menu_dialog():
                     else:
                         st.info("현재 예측 제외된 제품이 없습니다.")
             
-            pred_data = get_ai_predictions()
-            if pred_data:
-                pred_df = pd.DataFrame(pred_data).sort_values('_sort').drop(columns=['_sort'])
-                def hl_pred(s):
-                    colors = []
-                    for v in s:
-                        if '긴급' in str(v) or '오늘' in str(v): colors.append('background-color: #FADBD8; color: black; font-weight: bold;')
-                        elif '임박' in str(v): colors.append('background-color: #FCF3CF; color: black; font-weight: bold;')
-                        else: colors.append('')
-                    return colors
-                st.dataframe(pred_df.style.apply(hl_pred, subset=['생산 필요 상태']).set_properties(**{'text-align': 'center'}), use_container_width=True, hide_index=True)
+            if not HAS_HOLIDAYS:
+                st.warning("한국 공휴일 정보를 읽을 수 없어 영업일 기준 예측을 표시하지 않습니다. 'holidays' 패키지를 설치해주세요.")
             else:
-                st.success("데이터가 부족하거나 모든 제품이 제외되어 예측할 수 없습니다.")
+                pred_data = get_ai_predictions(today_str_kst)
+                if pred_data:
+                    pred_df = pd.DataFrame(pred_data).sort_values('_sort').drop(columns=['_sort'])
+                    def hl_pred(s):
+                        colors = []
+                        for v in s:
+                            if '긴급' in str(v) or '오늘' in str(v): colors.append('background-color: #FADBD8; color: black; font-weight: bold;')
+                            elif '임박' in str(v): colors.append('background-color: #FCF3CF; color: black; font-weight: bold;')
+                            else: colors.append('')
+                        return colors
+                    st.dataframe(pred_df.style.apply(hl_pred, subset=['생산 필요 상태']).set_properties(**{'text-align': 'center'}), use_container_width=True, hide_index=True)
+                else:
+                    st.success("데이터가 부족하거나 모든 제품이 제외되어 예측할 수 없습니다.")
     elif input_pw_admin != "": st.error("❌ 비밀번호 불일치")
 
 # ----------------------------------------------------
@@ -769,8 +844,11 @@ with tab_n:
                 st.warning(f"📢 **전달사항:** {ACTIVE_NOTICES[selected_product]}")
                 
         with col_p2:
-            target_value = get_historical_target(selected_product, prod_date_str) if selected_product else 0.0
-            st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
+            target_value = get_historical_target(selected_product, prod_date_str) if selected_product else None
+            if target_value is None:
+                st.warning(f"📌 {prod_date_str}에 적용되는 기준값 이력이 없습니다.")
+            else:
+                st.info(f"📌 해당 생산일({prod_date_str}) 기준 색도: **{float(target_value):.1f}**")
         
         if selected_product:
             last_records = get_equipment_last_records(selected_product)
@@ -796,18 +874,22 @@ with tab_n:
             st.info("👆 위에서 제품을 선택하시면 과거 설비별 생산 이력이 표시됩니다.")
 
         cs8, cs9, cs10 = st.columns([2,2,1])
-        with cs8: measured_value = st.number_input("측정 색도 입력", value=float(target_value), step=0.1, key="main_meas")
+        with cs8: measured_value = st.number_input("측정 색도 입력", value=float(target_value) if target_value is not None else 0.0, step=0.1, key="main_meas")
         with cs9: remarks_input = st.text_input("특이사항 (선택사항)", placeholder="메모 입력", key="main_rmk")
         with cs10:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("데이터 등록하기", type="primary", use_container_width=True, key="main_btn_save"):
                 if not selected_product: st.warning("⚠️ 제품명을 먼저 선택해주세요!")
                 elif not worker_name: st.warning("⚠️ 작업자 오류!")
+                elif target_value is None: st.error("⚠️ 선택한 생산일에 적용되는 기준값이 없어 등록할 수 없습니다.")
                 elif check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value): st.error("⚠️ 중복 데이터!")
                 else:
                     diff = round(measured_value - target_value, 1)
-                    save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val)
-                    st.cache_data.clear(); st.session_state['show_toast'] = "정상 등록 완료!"; st.rerun()
+                    saved = save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val)
+                    if not saved:
+                        st.error("⚠️ 같은 기록이 방금 등록되었습니다.")
+                    else:
+                        st.cache_data.clear(); st.session_state['show_toast'] = "정상 등록 완료!"; st.rerun()
 
 with tab_q:
     with st.container(border=True):
@@ -822,16 +904,22 @@ with tab_q:
                 idx = opts.index(sb)
                 qp, qe, qa, qw = rb.iloc[idx]['제품명'], rb.iloc[idx]['생산설비'], rb.iloc[idx]['투입량'], rb.iloc[idx]['작업자']
                 qt = get_historical_target(qp, today_str_kst)
-                with cq2: st.text_input("기준", f"{float(qt):.1f}", disabled=True, key="quick_tgt")
-                with cq3: qm = st.number_input("측정값", value=float(qt), step=0.1, key="quick_meas")
-                with cq4:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("🚀 1초 빠른 등록", type="primary", use_container_width=True, key="quick_btn"):
-                        if check_recent_duplicate(today_str_kst, qe, qp, qm): st.error("⚠️ 중복")
-                        else:
-                            diff = round(qm - qt, 1)
-                            save_to_db(today_str_kst, qe, qw, qp, qt, qm, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", "", qa)
-                            st.cache_data.clear(); st.session_state['show_toast'] = "빠른 등록 완료!"; st.rerun()
+                if qt is None:
+                    st.warning("오늘 적용되는 기준값 이력이 없어 빠른 등록을 할 수 없습니다.")
+                else:
+                    with cq2: st.text_input("기준", f"{float(qt):.1f}", disabled=True, key="quick_tgt")
+                    with cq3: qm = st.number_input("측정값", value=float(qt), step=0.1, key="quick_meas")
+                    with cq4:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("🚀 1초 빠른 등록", type="primary", use_container_width=True, key="quick_btn"):
+                            if check_recent_duplicate(today_str_kst, qe, qp, qm): st.error("⚠️ 중복")
+                            else:
+                                diff = round(qm - qt, 1)
+                                saved = save_to_db(today_str_kst, qe, qw, qp, qt, qm, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", "", qa)
+                                if not saved:
+                                    st.error("⚠️ 같은 기록이 방금 등록되었습니다.")
+                                else:
+                                    st.cache_data.clear(); st.session_state['show_toast'] = "빠른 등록 완료!"; st.rerun()
 
 st.markdown("---")
 st.subheader("📊 누적 측정 기록 조회")
@@ -876,7 +964,17 @@ if not ddf.empty:
         with mc[i+1]: st.metric(f"⚙️ {e}", f"{ec[e]} 건")
     st.markdown("<br>", unsafe_allow_html=True)
 
-def hl_stat(s): return ['color: white; background-color: #E74C3C; font-weight: bold;' if '불합격' in str(v) else 'color: #27AE60; font-weight: bold;' for v in s]
+def hl_stat(s):
+    colors = []
+    for value in s:
+        label = str(value)
+        if '불합격' in label:
+            colors.append('color: white; background-color: #E74C3C; font-weight: bold;')
+        elif label.startswith('합격'):
+            colors.append('color: #27AE60; font-weight: bold;')
+        else:
+            colors.append('color: #555; background-color: #F2F3F4;')
+    return colors
 def hl_eq(s):
     clrs = []
     for v in s:
