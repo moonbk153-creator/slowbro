@@ -518,7 +518,8 @@ def load_from_db():
         FROM color_records c
         """
         try: df = pd.read_sql_query(q, conn.connection)
-        except Exception: 
+        except Exception as e:
+            st.error(f"Neon에서 생산 기록을 읽지 못했습니다: {type(e).__name__}: {e}")
             return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
 
         if df.empty:
@@ -671,30 +672,36 @@ def migrate_sqlite_database(uploaded_file):
             missing = ", ".join(sorted(required_columns - set(record_columns)))
             raise ValueError(f"color_records에 필요한 열이 없습니다: {missing}")
 
-        target_columns, targets = read_table("target_history")
+        _, targets = read_table("target_history")
         _, notices = read_table("product_notices")
         _, workers = read_table("workers")
         _, excluded = read_table("excluded_products")
 
         conn = get_db_conn()
-        existing_count = conn.execute("SELECT COUNT(*) FROM color_records").fetchone()[0]
-        if existing_count:
-            raise ValueError(
-                "Neon에 이미 생산 기록이 있어 중복 이관을 막았습니다. "
-                "기록을 덮어쓰지 않도록 이관은 color_records가 비어 있을 때만 가능합니다."
-            )
-
         conn.execute("BEGIN IMMEDIATE")
-        # init_db/load_tgt가 만든 초기 작업자와 엑셀 기준값을 예전 DB 내용으로 교체합니다.
-        conn.execute("DELETE FROM target_history")
-        conn.execute("DELETE FROM product_notices")
-        conn.execute("DELETE FROM workers")
-        conn.execute("DELETE FROM excluded_products")
+        # 기존 Neon 기록은 유지하고, 백업과 완전히 같은 기록만 건너뜁니다.
+        def normalize_for_compare(value):
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return ("number", round(float(value), 8))
+            if isinstance(value, str):
+                return value.strip()
+            return value
 
         record_fields = [
-            "id", "timestamp", "production_date", "equipment", "worker", "product_name",
+            "timestamp", "production_date", "equipment", "worker", "product_name",
             "target_value", "measured_value", "difference", "status", "remarks", "input_amount", "checked",
         ]
+        existing_record_rows = conn.execute(
+            """SELECT timestamp, production_date, equipment, worker, product_name,
+                      target_value, measured_value, difference, status, remarks, input_amount, checked
+               FROM color_records"""
+        ).fetchall()
+        seen_record_signatures = {
+            tuple(normalize_for_compare(value) for value in row)
+            for row in existing_record_rows
+        }
         record_rows = []
         for row in records:
             values = dict(row)
@@ -705,39 +712,45 @@ def migrate_sqlite_database(uploaded_file):
             values.setdefault("remarks", "")
             values.setdefault("input_amount", "-")
             values.setdefault("checked", 0)
-            record_rows.append(tuple(values.get(field) for field in record_fields))
+            record_values = tuple(values.get(field) for field in record_fields)
+            signature = tuple(normalize_for_compare(value) for value in record_values)
+            if signature not in seen_record_signatures:
+                record_rows.append(record_values)
+                seen_record_signatures.add(signature)
         if record_rows:
             conn.executemany(
                 """INSERT INTO color_records
-                   (id, timestamp, production_date, equipment, worker, product_name, target_value,
+                   (timestamp, production_date, equipment, worker, product_name, target_value,
                     measured_value, difference, status, remarks, input_amount, checked)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT (id) DO NOTHING""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 record_rows,
             )
 
+        existing_target_rows = conn.execute(
+            "SELECT product_name, target_value, effective_date FROM target_history"
+        ).fetchall()
+        seen_target_signatures = {
+            tuple(normalize_for_compare(value) for value in row)
+            for row in existing_target_rows
+        }
         target_rows = []
         for row in targets:
             if {"product_name", "target_value", "effective_date"}.issubset(row):
-                target_rows.append((
-                    row.get("id"),
+                target_values = (
                     row.get("product_name"),
                     row.get("target_value"),
                     row.get("effective_date"),
-                ))
+                )
+                signature = tuple(normalize_for_compare(value) for value in target_values)
+                if signature not in seen_target_signatures:
+                    target_rows.append(target_values)
+                    seen_target_signatures.add(signature)
         if target_rows:
-            if "id" in target_columns:
-                conn.executemany(
-                    """INSERT INTO target_history (id, product_name, target_value, effective_date)
-                       VALUES (?, ?, ?, ?)""",
-                    target_rows,
-                )
-            else:
-                conn.executemany(
-                    """INSERT INTO target_history (product_name, target_value, effective_date)
-                       VALUES (?, ?, ?)""",
-                    [row[1:] for row in target_rows],
-                )
+            conn.executemany(
+                """INSERT INTO target_history (product_name, target_value, effective_date)
+                   VALUES (?, ?, ?)""",
+                target_rows,
+            )
 
         notice_rows = [
             (row.get("product_name"), row.get("notice_text"), row.get("start_date"), row.get("end_date"))
@@ -789,7 +802,8 @@ def migrate_sqlite_database(uploaded_file):
                )"""
         )
         conn.commit()
-        return len(records), len(target_rows)
+        skipped_duplicates = len(records) - len(record_rows)
+        return len(record_rows), len(target_rows), skipped_duplicates
     except Exception:
         if conn is not None:
             conn.rollback()
@@ -1168,9 +1182,15 @@ def admin_menu_dialog():
                 "새 앱을 배포한 뒤에는 아래에서 그 .db 파일을 올려 이관합니다."
             )
             st.caption(
-                "이 기능은 Neon에 생산 기록이 하나도 없을 때만 실행됩니다. "
-                "이미 Neon에 저장된 생산 기록은 덮어쓰지 않습니다."
+                "Neon의 기존 기록은 보존합니다. 백업과 내용이 완전히 같은 기록은 다시 넣지 않고, "
+                "새로 옮기는 기록에는 Neon에서 새 고유번호를 부여합니다."
             )
+            count_conn = get_db_conn()
+            try:
+                current_neon_count = count_conn.execute("SELECT COUNT(*) FROM color_records").fetchone()[0]
+            finally:
+                count_conn.close()
+            st.info(f"현재 Neon에 저장된 생산 기록: {current_neon_count:,}건")
             sqlite_upload = st.file_uploader(
                 "예전 앱에서 받은 SQLite 백업 파일(.db)",
                 type=["db", "sqlite", "sqlite3"],
@@ -1185,10 +1205,11 @@ def admin_menu_dialog():
             ):
                 try:
                     with st.spinner("기록을 옮기는 중입니다. 창을 닫지 마세요."):
-                        moved_records, moved_targets = migrate_sqlite_database(sqlite_upload)
+                        moved_records, moved_targets, skipped_duplicates = migrate_sqlite_database(sqlite_upload)
                     st.cache_data.clear()
                     st.session_state["show_toast"] = (
-                        f"이관 완료: 생산 기록 {moved_records:,}건, 기준값 이력 {moved_targets:,}건"
+                        f"이관 완료: 새 기록 {moved_records:,}건, 기준값 이력 {moved_targets:,}건, "
+                        f"중복 건너뜀 {skipped_duplicates:,}건"
                     )
                     st.rerun()
                 except Exception as e:
