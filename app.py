@@ -1440,6 +1440,10 @@ if not ddf.empty:
         ddf = ddf.sort_values(by=['s', '생산일', 'prod_first_id', '고유번호'], ascending=[True, False, True, True])
         ddf = ddf.drop(columns=['s', 'prod_first_id'])
 
+    # 화면 정렬이 끝난 뒤 내부 행 번호를 화면 순서대로 1부터 다시 매깁니다.
+    ddf = ddf.reset_index(drop=True)
+    ddf.index = ddf.index + 1
+
 if not ddf.empty:
     tb = len(ddf)
     mt = "오늘" if dm=="오늘" else fd_str if dm=="특정 일자" else "전체"
