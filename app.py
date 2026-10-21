@@ -35,7 +35,19 @@ if 'show_toast' in st.session_state:
 
 EXCEL_FILE = 'data sheet.xlsx'
 EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
+SILO_NUMBER_OPTIONS = [""] + [f"{number}번" for number in range(1, 11)]
 ADMIN_PASSWORD, ACCESS_PASSWORD = st.secrets["ADMIN_PASSWORD"], st.secrets["APP_PASSWORD"]
+
+def normalize_silo_number(value):
+    """1~10 사일로 번호는 '1번' 형식으로 통일하고, 그 외 과거 값은 그대로 보존합니다."""
+    text_value = "" if value is None else str(value).strip()
+    if text_value in ("", "nan", "None", "<NA>"):
+        return ""
+    if text_value.isdigit() and 1 <= int(text_value) <= 10:
+        return f"{int(text_value)}번"
+    if text_value in SILO_NUMBER_OPTIONS:
+        return text_value
+    return text_value
 
 # ----------------------------------------------------
 # 1. 인증 및 기본 설정
@@ -191,6 +203,8 @@ def init_db():
             status TEXT,
             remarks TEXT DEFAULT '',
             input_amount TEXT DEFAULT '-',
+            discharge_method TEXT DEFAULT '',
+            silo_number TEXT DEFAULT '',
             checked INTEGER DEFAULT 0
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS target_history (
@@ -214,6 +228,8 @@ def init_db():
 
         conn.execute("ALTER TABLE color_records ADD COLUMN IF NOT EXISTS remarks TEXT DEFAULT ''")
         conn.execute("ALTER TABLE color_records ADD COLUMN IF NOT EXISTS input_amount TEXT DEFAULT '-'")
+        conn.execute("ALTER TABLE color_records ADD COLUMN IF NOT EXISTS discharge_method TEXT DEFAULT ''")
+        conn.execute("ALTER TABLE color_records ADD COLUMN IF NOT EXISTS silo_number TEXT DEFAULT ''")
         conn.execute("ALTER TABLE color_records ADD COLUMN IF NOT EXISTS checked INTEGER DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_color_prod_date ON color_records(product_name, production_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_target_hist ON target_history(product_name, effective_date)")
@@ -316,15 +332,19 @@ def delete_from_db(record_id):
 
 
 def update_db(record_id, d_date, eq, wk, product, target, measured, diff, status, remarks, amount, checked=0):
+def update_db(record_id, d_date, eq, wk, product, target, measured, diff, status, remarks, amount, checked=0, discharge_method="", silo_number=""):
     conn = get_db_conn()
     try:
         conn.execute(
             """UPDATE color_records
                SET production_date=?, equipment=?, worker=?, product_name=?, target_value=?,
                    measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=?
+                   measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=?,
+                   discharge_method=?, silo_number=?
                WHERE id=?""",
             (d_date, str(eq).strip(), str(wk).strip(), str(product).strip(), target,
              measured, diff, status, remarks, amount, checked, record_id),
+             measured, diff, status, remarks, amount, checked, discharge_method, silo_number, record_id),
         )
         conn.commit()
     finally:
@@ -418,6 +438,7 @@ def _is_recent_duplicate(conn, date_text, equipment, product, measured_value):
 
 
 def save_to_db(date_text, equipment, worker, product, target, measured, difference, status, remarks, amount):
+def save_to_db(date_text, equipment, worker, product, target, measured, difference, status, remarks, amount, discharge_method="", silo_number=""):
     conn = get_db_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -431,8 +452,11 @@ def save_to_db(date_text, equipment, worker, product, target, measured, differen
                (timestamp, production_date, equipment, worker, product_name, target_value,
                 measured_value, difference, status, remarks, input_amount)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                measured_value, difference, status, remarks, input_amount, discharge_method, silo_number)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (timestamp, date_text, str(equipment).strip(), str(worker).strip(),
              str(product).strip(), target, measured, difference, status, remarks, amount),
+             str(product).strip(), target, measured, difference, status, remarks, amount, discharge_method, silo_number),
         )
         conn.execute("DELETE FROM excluded_products WHERE product_name = ?", (str(product).strip(),))
         conn.commit()
@@ -509,6 +533,10 @@ def load_from_db():
         SELECT 
             c.id as 고유번호, c.timestamp as 입력일시, c.production_date as 생산일, 
             c.equipment as 생산설비, COALESCE(c.input_amount, '-') as 투입량, 
+            c.equipment as 생산설비,
+            COALESCE(c.discharge_method, '') as 배출방식,
+            COALESCE(c.silo_number, '') as 사일로번호,
+            COALESCE(c.input_amount, '-') as 투입량,
             c.worker as 작업자, c.product_name as 제품명, c.measured_value as 측정색도, 
             COALESCE(c.remarks, '') as 특이사항, COALESCE(c.checked, 0) as checked_status, 
             COALESCE(
@@ -521,13 +549,16 @@ def load_from_db():
         except Exception as e:
             st.error(f"Neon에서 생산 기록을 읽지 못했습니다: {type(e).__name__}: {e}")
             return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
+            return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '배출방식', '사일로번호', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
 
         if df.empty:
             return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
+            return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '배출방식', '사일로번호', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
 
         df['생산일'] = df['생산일'].apply(safe_date_parse)
         df['제품명'] = df['제품명'].astype(str).str.strip()
         df['생산설비'] = df['생산설비'].astype(str).str.strip()
+        df['사일로번호'] = df['사일로번호'].apply(normalize_silo_number)
         df['작업자'] = df['작업자'].astype(str).str.strip().replace(['nan', 'None', '', 'NaN'], '미입력(과거기록)')
         df['투입량'] = df.apply(auto_fill_input_amount, axis=1)
         df['확인여부'] = df['checked_status'].apply(lambda x: "확인완료 ✅" if x == 1 else "미확인 ❌")
@@ -575,6 +606,7 @@ def load_from_db():
         
         df['특이사항'] = df['특이사항'].str.strip()
         return df[['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
+        return df[['생산일', '제품명', '생산설비', '배출방식', '사일로번호', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
     finally:
         conn.close()
 
@@ -692,10 +724,14 @@ def migrate_sqlite_database(uploaded_file):
         record_fields = [
             "timestamp", "production_date", "equipment", "worker", "product_name",
             "target_value", "measured_value", "difference", "status", "remarks", "input_amount", "checked",
+            "target_value", "measured_value", "difference", "status", "remarks", "input_amount",
+            "discharge_method", "silo_number", "checked",
         ]
         existing_record_rows = conn.execute(
             """SELECT timestamp, production_date, equipment, worker, product_name,
                       target_value, measured_value, difference, status, remarks, input_amount, checked
+                      target_value, measured_value, difference, status, remarks, input_amount,
+                      discharge_method, silo_number, checked
                FROM color_records"""
         ).fetchall()
         seen_record_signatures = {
@@ -711,6 +747,8 @@ def migrate_sqlite_database(uploaded_file):
             values.setdefault("status", "")
             values.setdefault("remarks", "")
             values.setdefault("input_amount", "-")
+            values.setdefault("discharge_method", "")
+            values.setdefault("silo_number", "")
             values.setdefault("checked", 0)
             record_values = tuple(values.get(field) for field in record_fields)
             signature = tuple(normalize_for_compare(value) for value in record_values)
@@ -723,6 +761,8 @@ def migrate_sqlite_database(uploaded_file):
                    (timestamp, production_date, equipment, worker, product_name, target_value,
                     measured_value, difference, status, remarks, input_amount, checked)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    measured_value, difference, status, remarks, input_amount, discharge_method, silo_number, checked)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 record_rows,
             )
 
@@ -920,6 +960,8 @@ def admin_menu_dialog():
                         row = conn.execute(
                             """SELECT product_name, target_value, production_date, equipment, worker,
                                       measured_value, remarks, input_amount, COALESCE(checked, 0)
+                                      measured_value, remarks, input_amount, COALESCE(checked, 0),
+                                      COALESCE(discharge_method, ''), COALESCE(silo_number, '')
                                FROM color_records WHERE id=?""",
                             (tid,),
                         ).fetchone()
@@ -940,15 +982,41 @@ def admin_menu_dialog():
                         nw = st.selectbox("작업자", CURRENT_WORKERS, index=CURRENT_WORKERS.index(row[4]) if row[4] in CURRENT_WORKERS else 0, key="admin_sel_worker")
                         nm = st.number_input("측정", value=float(row[5]), step=0.1, key="admin_num_meas")
                         nrm = st.text_input("특이사항", value=row[6], key="admin_txt_rmk")
+
+                        neq_clean = str(neq).lower().replace(" ", "")
+                        admin_discharge_method, admin_silo_number = "", ""
+                        if "120" in neq_clean:
+                            discharge_options = ["선택하세요", "사일로 이송", "브루트통 배출"]
+                            old_method = row[9] if row[9] in discharge_options else "선택하세요"
+                            admin_discharge_method = st.selectbox(
+                                "배출/보관 방식 (뷸러 120kg)",
+                                discharge_options,
+                                index=discharge_options.index(old_method),
+                                key=f"admin_sel_discharge_method_{tid}",
+                            )
+                            if admin_discharge_method == "사일로 이송":
+                                stored_silo = normalize_silo_number(row[10])
+                                admin_silo_number = st.selectbox(
+                                    "사일로 번호",
+                                    options=SILO_NUMBER_OPTIONS,
+                                    index=SILO_NUMBER_OPTIONS.index(stored_silo) if stored_silo in SILO_NUMBER_OPTIONS else 0,
+                                    format_func=lambda value: value or "선택하세요",
+                                    key=f"admin_sel_silo_number_{tid}",
+                                )
                         
                         if st.button("✏️ 수정 완료", key="admin_btn_edit_record"):
                             tgt = get_historical_target(nprod, npd)
                             if tgt is None:
                                 st.error("선택한 날짜에 적용되는 기준값이 없어 수정할 수 없습니다. 기준 이력을 먼저 등록해주세요.")
+                            elif "120" in neq_clean and admin_discharge_method == "선택하세요":
+                                st.error("뷸러 120kg의 배출/보관 방식을 선택해주세요.")
+                            elif admin_discharge_method == "사일로 이송" and not admin_silo_number:
+                                st.error("사일로로 이송한 경우 사일로 번호를 입력해주세요.")
                             else:
                                 diff = round(nm - tgt, 1)
                                 stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
                                 update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8])
+                                update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8], admin_discharge_method, admin_silo_number)
                                 st.cache_data.clear(); st.session_state['show_toast'] = "수정됨!"; st.rerun()
         
         with t3:
@@ -1318,6 +1386,24 @@ with tab_n:
             else:
                 input_amount_val = "12kg" if "태환" in equip_clean else "25kg" if "프로밧" in equip_clean else "60kg" if "60" in equip_clean else "125kg" if "120" in equip_clean else "-"
                 st.text_input("투입량 (고정)", input_amount_val, disabled=True, key="main_amt_txt")
+
+        discharge_method, silo_number = "", ""
+        uses_buhler_silo = "120" in equip_clean
+        storage_form_version = st.session_state.get("main_storage_form_version", 0)
+        if uses_buhler_silo:
+            discharge_method = st.radio(
+                "배출/보관 방식 (뷸러 120kg)",
+                ["선택하세요", "사일로 이송", "브루트통 배출"],
+                horizontal=True,
+                key=f"main_discharge_method_{storage_form_version}",
+            )
+            if discharge_method == "사일로 이송":
+                silo_number = st.selectbox(
+                    "사일로 번호",
+                    options=SILO_NUMBER_OPTIONS,
+                    format_func=lambda value: value or "선택하세요",
+                    key=f"main_silo_select_{storage_form_version}",
+                )
                 
         col_p1, col_p2 = st.columns([2, 1])
         with col_p1:
@@ -1370,13 +1456,17 @@ with tab_n:
                 if not selected_product: st.warning("⚠️ 제품명을 먼저 선택해주세요!")
                 elif not worker_name: st.warning("⚠️ 작업자 오류!")
                 elif target_value is None: st.error("⚠️ 선택한 생산일에 적용되는 기준값이 없어 등록할 수 없습니다.")
+                elif uses_buhler_silo and discharge_method == "선택하세요": st.error("⚠️ 뷸러 120kg의 배출/보관 방식을 선택해주세요.")
+                elif discharge_method == "사일로 이송" and not silo_number: st.error("⚠️ 사일로로 이송한 경우 사일로 번호를 입력해주세요.")
                 elif check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value): st.error("⚠️ 중복 데이터!")
                 else:
                     diff = round(measured_value - target_value, 1)
                     saved = save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val)
+                    saved = save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val, discharge_method, silo_number)
                     if not saved:
                         st.error("⚠️ 같은 기록이 방금 등록되었습니다.")
                     else:
+                        st.session_state["main_storage_form_version"] = storage_form_version + 1
                         st.cache_data.clear(); st.session_state['show_toast'] = "정상 등록 완료!"; st.rerun()
 
 with tab_q:
@@ -1386,11 +1476,44 @@ with tab_q:
         else:
             rb = tdf[['제품명','생산설비','투입량','작업자']].drop_duplicates().reset_index(drop=True)
             opts = [f"▶ {r['제품명']} ({r['생산설비']} / {r['투입량']} / {r['작업자']})" for _,r in rb.iterrows()]
+            rb = tdf[['제품명','생산설비','투입량','작업자','배출방식','사일로번호']].drop_duplicates().reset_index(drop=True)
+            opts = []
+            for _, r in rb.iterrows():
+                storage_text = ""
+                if r['배출방식'] == "사일로 이송" and str(r['사일로번호']).strip():
+                    storage_text = f" / 사일로 {r['사일로번호']}"
+                elif r['배출방식'] == "브루트통 배출":
+                    storage_text = " / 브루트통"
+                opts.append(f"▶ {r['제품명']} ({r['생산설비']} / {r['투입량']} / {r['작업자']}{storage_text})")
             cq1, cq2, cq3, cq4 = st.columns([3,1,1,1])
             with cq1: sb = st.selectbox("이어서 측정할 제품", opts, key="quick_sel")
             if sb:
                 idx = opts.index(sb)
                 qp, qe, qa, qw = rb.iloc[idx]['제품명'], rb.iloc[idx]['생산설비'], rb.iloc[idx]['투입량'], rb.iloc[idx]['작업자']
+                selected_row = rb.iloc[idx]
+                qp, qe, qa, qw = selected_row['제품명'], selected_row['생산설비'], selected_row['투입량'], selected_row['작업자']
+                qe_clean = str(qe).lower().replace(" ", "")
+                q_discharge_method, q_silo_number = "", ""
+                q_uses_buhler_silo = "120" in qe_clean
+                quick_storage_version = st.session_state.get("quick_storage_form_version", 0)
+                if q_uses_buhler_silo:
+                    quick_options = ["선택하세요", "사일로 이송", "브루트통 배출"]
+                    stored_method = selected_row['배출방식'] if selected_row['배출방식'] in quick_options else "선택하세요"
+                    q_discharge_method = st.selectbox(
+                        "배출/보관 방식 (뷸러 120kg)",
+                        quick_options,
+                        index=quick_options.index(stored_method),
+                        key=f"quick_discharge_{quick_storage_version}_{idx}",
+                    )
+                    if q_discharge_method == "사일로 이송":
+                        old_silo = normalize_silo_number(selected_row['사일로번호']) if stored_method == "사일로 이송" else ""
+                        q_silo_number = st.selectbox(
+                            "사일로 번호",
+                            options=SILO_NUMBER_OPTIONS,
+                            index=SILO_NUMBER_OPTIONS.index(old_silo) if old_silo in SILO_NUMBER_OPTIONS else 0,
+                            format_func=lambda value: value or "선택하세요",
+                            key=f"quick_silo_select_{quick_storage_version}_{idx}",
+                        )
                 qt = get_historical_target(qp, today_str_kst)
                 if qt is None:
                     st.warning("오늘 적용되는 기준값 이력이 없어 빠른 등록을 할 수 없습니다.")
@@ -1400,13 +1523,18 @@ with tab_q:
                     with cq4:
                         st.markdown("<br>", unsafe_allow_html=True)
                         if st.button("🚀 1초 빠른 등록", type="primary", use_container_width=True, key="quick_btn"):
+                            if q_uses_buhler_silo and q_discharge_method == "선택하세요": st.error("⚠️ 뷸러 120kg의 배출/보관 방식을 선택해주세요.")
+                            elif q_discharge_method == "사일로 이송" and not q_silo_number: st.error("⚠️ 사일로로 이송한 경우 사일로 번호를 입력해주세요.")
                             if check_recent_duplicate(today_str_kst, qe, qp, qm): st.error("⚠️ 중복")
+                            elif check_recent_duplicate(today_str_kst, qe, qp, qm): st.error("⚠️ 중복")
                             else:
                                 diff = round(qm - qt, 1)
                                 saved = save_to_db(today_str_kst, qe, qw, qp, qt, qm, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", "", qa)
+                                saved = save_to_db(today_str_kst, qe, qw, qp, qt, qm, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", "", qa, q_discharge_method, q_silo_number)
                                 if not saved:
                                     st.error("⚠️ 같은 기록이 방금 등록되었습니다.")
                                 else:
+                                    st.session_state["quick_storage_form_version"] = quick_storage_version + 1
                                     st.cache_data.clear(); st.session_state['show_toast'] = "빠른 등록 완료!"; st.rerun()
 
 st.markdown("---")
