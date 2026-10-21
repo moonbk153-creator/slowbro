@@ -187,6 +187,7 @@ def get_db_conn():
     return DatabaseConnection()
 
 
+@st.cache_resource(show_spinner=False)
 def init_db():
     conn = get_db_conn()
     try:
@@ -246,8 +247,10 @@ def init_db():
         raise
     finally:
         conn.close()
+    return True
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def get_all_workers():
     conn = get_db_conn()
     try:
@@ -349,6 +352,7 @@ def update_db(record_id, d_date, eq, wk, product, target, measured, diff, status
         conn.close()
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def get_historical_target(product_name, date_text):
     conn = get_db_conn()
     try:
@@ -389,6 +393,7 @@ def delete_notice(product):
         conn.close()
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def get_all_active_notices(date_text):
     conn = get_db_conn()
     try:
@@ -483,27 +488,26 @@ def get_last_record(product):
         conn.close()
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def get_equipment_last_records(product_name):
     conn = get_db_conn()
     try:
         query = """
             WITH RankedRecords AS (
                 SELECT equipment, production_date, measured_value, status, id,
+                       COUNT(*) OVER (PARTITION BY equipment) AS cnt,
                        ROW_NUMBER() OVER (
                            PARTITION BY equipment
                            ORDER BY production_date DESC, timestamp DESC, id DESC
                        ) AS rn
                 FROM color_records WHERE product_name = ?
-            ),
-            EquipCounts AS (
-                SELECT equipment, COUNT(*) AS cnt
-                FROM color_records WHERE product_name = ? GROUP BY equipment
             )
-            SELECT r.equipment, r.production_date, r.measured_value, r.status, c.cnt
-            FROM RankedRecords r JOIN EquipCounts c ON r.equipment = c.equipment
-            WHERE r.rn = 1 ORDER BY c.cnt DESC, r.production_date DESC
+            SELECT equipment, production_date, measured_value, status, cnt
+            FROM RankedRecords
+            WHERE rn = 1 ORDER BY cnt DESC, production_date DESC
         """
-        return conn.execute(query, (str(product_name).strip(), str(product_name).strip())).fetchall()
+        rows = conn.execute(query, (str(product_name).strip(),)).fetchall()
+        return [tuple(row) for row in rows]
     finally:
         conn.close()
 
@@ -852,9 +856,6 @@ def to_excel(df):
 # Neon 연결을 확인하고 필요한 표를 준비합니다.
 try:
     init_db()
-    check_conn = get_db_conn()
-    check_conn.execute("SELECT 1")
-    check_conn.close()
 except Exception as e:
     st.title("🛑 Neon 데이터베이스에 연결할 수 없습니다")
     st.error("Streamlit Secrets의 Neon 연결 주소와 requirements.txt 설정을 확인해주세요.")
