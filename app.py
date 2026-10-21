@@ -331,21 +331,19 @@ def delete_from_db(record_id):
         conn.close()
 
 
-def update_db(record_id, d_date, eq, wk, product, target, measured, diff, status, remarks, amount, checked=0):
 def update_db(record_id, d_date, eq, wk, product, target, measured, diff, status, remarks, amount, checked=0, discharge_method="", silo_number=""):
     conn = get_db_conn()
     try:
-        conn.execute(
-            """UPDATE color_records
-               SET production_date=?, equipment=?, worker=?, product_name=?, target_value=?,
-                   measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=?
-                   measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=?,
-                   discharge_method=?, silo_number=?
-               WHERE id=?""",
-            (d_date, str(eq).strip(), str(wk).strip(), str(product).strip(), target,
-             measured, diff, status, remarks, amount, checked, record_id),
-             measured, diff, status, remarks, amount, checked, discharge_method, silo_number, record_id),
+        query = """UPDATE color_records
+                   SET production_date=?, equipment=?, worker=?, product_name=?, target_value=?,
+                       measured_value=?, difference=?, status=?, remarks=?, input_amount=?, checked=?,
+                       discharge_method=?, silo_number=?
+                   WHERE id=?"""
+        values = (
+            d_date, str(eq).strip(), str(wk).strip(), str(product).strip(), target,
+            measured, diff, status, remarks, amount, checked, discharge_method, silo_number, record_id,
         )
+        conn.execute(query, values)
         conn.commit()
     finally:
         conn.close()
@@ -437,7 +435,6 @@ def _is_recent_duplicate(conn, date_text, equipment, product, measured_value):
         return False
 
 
-def save_to_db(date_text, equipment, worker, product, target, measured, difference, status, remarks, amount):
 def save_to_db(date_text, equipment, worker, product, target, measured, difference, status, remarks, amount, discharge_method="", silo_number=""):
     conn = get_db_conn()
     try:
@@ -450,12 +447,9 @@ def save_to_db(date_text, equipment, worker, product, target, measured, differen
         conn.execute(
             """INSERT INTO color_records
                (timestamp, production_date, equipment, worker, product_name, target_value,
-                measured_value, difference, status, remarks, input_amount)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 measured_value, difference, status, remarks, input_amount, discharge_method, silo_number)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (timestamp, date_text, str(equipment).strip(), str(worker).strip(),
-             str(product).strip(), target, measured, difference, status, remarks, amount),
              str(product).strip(), target, measured, difference, status, remarks, amount, discharge_method, silo_number),
         )
         conn.execute("DELETE FROM excluded_products WHERE product_name = ?", (str(product).strip(),))
@@ -532,7 +526,6 @@ def load_from_db():
         q = """
         SELECT 
             c.id as 고유번호, c.timestamp as 입력일시, c.production_date as 생산일, 
-            c.equipment as 생산설비, COALESCE(c.input_amount, '-') as 투입량, 
             c.equipment as 생산설비,
             COALESCE(c.discharge_method, '') as 배출방식,
             COALESCE(c.silo_number, '') as 사일로번호,
@@ -548,11 +541,9 @@ def load_from_db():
         try: df = pd.read_sql_query(q, conn.connection)
         except Exception as e:
             st.error(f"Neon에서 생산 기록을 읽지 못했습니다: {type(e).__name__}: {e}")
-            return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
             return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '배출방식', '사일로번호', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
 
         if df.empty:
-            return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
             return pd.DataFrame(columns=['생산일', '제품명', '생산설비', '배출방식', '사일로번호', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호'])
 
         df['생산일'] = df['생산일'].apply(safe_date_parse)
@@ -605,7 +596,6 @@ def load_from_db():
         df.loc[l_idx, '특이사항'] = "[마지막 배치 🏁] " + df.loc[l_idx, '특이사항']
         
         df['특이사항'] = df['특이사항'].str.strip()
-        return df[['생산일', '제품명', '생산설비', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
         return df[['생산일', '제품명', '생산설비', '배출방식', '사일로번호', '측정색도', '오차', '기준색도', '작업자', '투입량', '판정', '확인여부', '특이사항', '입력일시', '고유번호']]
     finally:
         conn.close()
@@ -723,13 +713,11 @@ def migrate_sqlite_database(uploaded_file):
 
         record_fields = [
             "timestamp", "production_date", "equipment", "worker", "product_name",
-            "target_value", "measured_value", "difference", "status", "remarks", "input_amount", "checked",
             "target_value", "measured_value", "difference", "status", "remarks", "input_amount",
             "discharge_method", "silo_number", "checked",
         ]
         existing_record_rows = conn.execute(
             """SELECT timestamp, production_date, equipment, worker, product_name,
-                      target_value, measured_value, difference, status, remarks, input_amount, checked
                       target_value, measured_value, difference, status, remarks, input_amount,
                       discharge_method, silo_number, checked
                FROM color_records"""
@@ -759,8 +747,6 @@ def migrate_sqlite_database(uploaded_file):
             conn.executemany(
                 """INSERT INTO color_records
                    (timestamp, production_date, equipment, worker, product_name, target_value,
-                    measured_value, difference, status, remarks, input_amount, checked)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     measured_value, difference, status, remarks, input_amount, discharge_method, silo_number, checked)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 record_rows,
@@ -959,7 +945,6 @@ def admin_menu_dialog():
                     try:
                         row = conn.execute(
                             """SELECT product_name, target_value, production_date, equipment, worker,
-                                      measured_value, remarks, input_amount, COALESCE(checked, 0)
                                       measured_value, remarks, input_amount, COALESCE(checked, 0),
                                       COALESCE(discharge_method, ''), COALESCE(silo_number, '')
                                FROM color_records WHERE id=?""",
@@ -1015,7 +1000,6 @@ def admin_menu_dialog():
                             else:
                                 diff = round(nm - tgt, 1)
                                 stat = "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴"
-                                update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8])
                                 update_db(tid, npd, neq, nw, nprod, tgt, nm, diff, stat, nrm, namt, row[8], admin_discharge_method, admin_silo_number)
                                 st.cache_data.clear(); st.session_state['show_toast'] = "수정됨!"; st.rerun()
         
@@ -1461,7 +1445,6 @@ with tab_n:
                 elif check_recent_duplicate(prod_date_str, selected_equipment, selected_product, measured_value): st.error("⚠️ 중복 데이터!")
                 else:
                     diff = round(measured_value - target_value, 1)
-                    saved = save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val)
                     saved = save_to_db(prod_date_str, selected_equipment, worker_name, selected_product, target_value, measured_value, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", remarks_input, input_amount_val, discharge_method, silo_number)
                     if not saved:
                         st.error("⚠️ 같은 기록이 방금 등록되었습니다.")
@@ -1474,8 +1457,6 @@ with tab_q:
         tdf = history_df[history_df['생산일'] == today_str_kst]
         if tdf.empty: st.info("오늘 첫 생산을 일반 탭에서 진행해주세요.")
         else:
-            rb = tdf[['제품명','생산설비','투입량','작업자']].drop_duplicates().reset_index(drop=True)
-            opts = [f"▶ {r['제품명']} ({r['생산설비']} / {r['투입량']} / {r['작업자']})" for _,r in rb.iterrows()]
             rb = tdf[['제품명','생산설비','투입량','작업자','배출방식','사일로번호']].drop_duplicates().reset_index(drop=True)
             opts = []
             for _, r in rb.iterrows():
@@ -1489,7 +1470,6 @@ with tab_q:
             with cq1: sb = st.selectbox("이어서 측정할 제품", opts, key="quick_sel")
             if sb:
                 idx = opts.index(sb)
-                qp, qe, qa, qw = rb.iloc[idx]['제품명'], rb.iloc[idx]['생산설비'], rb.iloc[idx]['투입량'], rb.iloc[idx]['작업자']
                 selected_row = rb.iloc[idx]
                 qp, qe, qa, qw = selected_row['제품명'], selected_row['생산설비'], selected_row['투입량'], selected_row['작업자']
                 qe_clean = str(qe).lower().replace(" ", "")
@@ -1525,11 +1505,9 @@ with tab_q:
                         if st.button("🚀 1초 빠른 등록", type="primary", use_container_width=True, key="quick_btn"):
                             if q_uses_buhler_silo and q_discharge_method == "선택하세요": st.error("⚠️ 뷸러 120kg의 배출/보관 방식을 선택해주세요.")
                             elif q_discharge_method == "사일로 이송" and not q_silo_number: st.error("⚠️ 사일로로 이송한 경우 사일로 번호를 입력해주세요.")
-                            if check_recent_duplicate(today_str_kst, qe, qp, qm): st.error("⚠️ 중복")
                             elif check_recent_duplicate(today_str_kst, qe, qp, qm): st.error("⚠️ 중복")
                             else:
                                 diff = round(qm - qt, 1)
-                                saved = save_to_db(today_str_kst, qe, qw, qp, qt, qm, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", "", qa)
                                 saved = save_to_db(today_str_kst, qe, qw, qp, qt, qm, diff, "합격 🟢" if abs(diff)<=2.0 else "불합격 🔴", "", qa, q_discharge_method, q_silo_number)
                                 if not saved:
                                     st.error("⚠️ 같은 기록이 방금 등록되었습니다.")
