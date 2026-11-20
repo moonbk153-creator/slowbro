@@ -3,7 +3,7 @@ import pandas as pd
 import sqlite3
 import tempfile
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date as date_type
 import io 
 import pytz
 import numpy as np
@@ -75,6 +75,57 @@ def safe_date_parse(val):
     v = v.split(" ")[0].replace("/", "-").replace(".", "-")
     try: return pd.to_datetime(v).strftime("%Y-%m-%d")
     except: return v
+
+def parse_excel_date(value):
+    """엑셀의 날짜 셀, 날짜 문자열, 엑셀 날짜 일련번호를 YYYY-MM-DD로 바꿉니다."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (pd.Timestamp, datetime, date_type)):
+        return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, (bool, np.bool_)):
+        numeric_value = float(value)
+        if not np.isfinite(numeric_value):
+            return ""
+        if numeric_value.is_integer() and 19000101 <= numeric_value <= 99991231:
+            try:
+                return datetime.strptime(str(int(numeric_value)), "%Y%m%d").strftime("%Y-%m-%d")
+            except ValueError:
+                return ""
+        if 1 <= numeric_value <= 2958465:
+            try:
+                return (datetime(1899, 12, 30) + timedelta(days=numeric_value)).strftime("%Y-%m-%d")
+            except (OverflowError, ValueError):
+                return ""
+        return ""
+
+    text_value = str(value).strip()
+    if text_value in ("", "nan", "None", "NaN", "NaT", "<NA>"):
+        return ""
+
+    if re.fullmatch(r"\d+(?:\.0+)?", text_value):
+        try:
+            numeric_value = float(text_value)
+            if numeric_value.is_integer():
+                integer_value = int(numeric_value)
+                if 19000101 <= integer_value <= 99991231:
+                    return datetime.strptime(str(integer_value), "%Y%m%d").strftime("%Y-%m-%d")
+                if 1 <= numeric_value <= 2958465:
+                    return (datetime(1899, 12, 30) + timedelta(days=numeric_value)).strftime("%Y-%m-%d")
+        except (OverflowError, ValueError):
+            return ""
+
+    normalized_date = safe_date_parse(text_value)
+    try:
+        return datetime.strptime(normalized_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return ""
 
 # ----------------------------------------------------
 # 2. Neon PostgreSQL 데이터베이스
@@ -1094,10 +1145,8 @@ def admin_menu_dialog():
                                 validation_errors.append(f"{row_num}행: 제품명이 비어 있습니다.")
                                 continue
 
-                            date_text = safe_date_parse(r['적용시작일'])
-                            try:
-                                effective_date = datetime.strptime(date_text, "%Y-%m-%d").strftime("%Y-%m-%d")
-                            except (TypeError, ValueError):
+                            effective_date = parse_excel_date(r['적용시작일'])
+                            if not effective_date:
                                 validation_errors.append(f"{row_num}행: 적용시작일을 날짜로 읽을 수 없습니다.")
                                 continue
 
