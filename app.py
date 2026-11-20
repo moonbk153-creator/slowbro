@@ -77,7 +77,7 @@ def safe_date_parse(val):
     except: return v
 
 def parse_excel_date(value):
-    """엑셀의 날짜 셀, 날짜 문자열, 엑셀 날짜 일련번호를 YYYY-MM-DD로 바꿉니다."""
+    """엑셀 날짜 셀, 여러 날짜 문자열, Excel 일련번호를 YYYY-MM-DD로 바꿉니다."""
     if value is None:
         return ""
     try:
@@ -89,43 +89,65 @@ def parse_excel_date(value):
     if isinstance(value, (pd.Timestamp, datetime, date_type)):
         return value.strftime("%Y-%m-%d")
 
-    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, (bool, np.bool_)):
-        numeric_value = float(value)
-        if not np.isfinite(numeric_value):
+    def from_number(number):
+        if not np.isfinite(number):
             return ""
-        if numeric_value.is_integer() and 19000101 <= numeric_value <= 99991231:
+        if number.is_integer() and 19000101 <= number <= 99991231:
             try:
-                return datetime.strptime(str(int(numeric_value)), "%Y%m%d").strftime("%Y-%m-%d")
+                return datetime.strptime(str(int(number)), "%Y%m%d").strftime("%Y-%m-%d")
             except ValueError:
                 return ""
-        if 1 <= numeric_value <= 2958465:
+        if 1 <= number <= 2958465:
             try:
-                return (datetime(1899, 12, 30) + timedelta(days=numeric_value)).strftime("%Y-%m-%d")
+                return (datetime(1899, 12, 30) + timedelta(days=number)).strftime("%Y-%m-%d")
             except (OverflowError, ValueError):
                 return ""
         return ""
+
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, (bool, np.bool_)):
+        return from_number(float(value))
 
     text_value = str(value).strip()
     if text_value in ("", "nan", "None", "NaN", "NaT", "<NA>"):
         return ""
 
-    if re.fullmatch(r"\d+(?:\.0+)?", text_value):
+    korean_date = re.fullmatch(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일?", text_value)
+    if korean_date:
         try:
-            numeric_value = float(text_value)
-            if numeric_value.is_integer():
-                integer_value = int(numeric_value)
-                if 19000101 <= integer_value <= 99991231:
-                    return datetime.strptime(str(integer_value), "%Y%m%d").strftime("%Y-%m-%d")
-                if 1 <= numeric_value <= 2958465:
-                    return (datetime(1899, 12, 30) + timedelta(days=numeric_value)).strftime("%Y-%m-%d")
-        except (OverflowError, ValueError):
+            return datetime(*[int(part) for part in korean_date.groups()]).strftime("%Y-%m-%d")
+        except ValueError:
             return ""
 
-    normalized_date = safe_date_parse(text_value)
+    year_first_date = re.match(r"^\s*(\d{4})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{1,2})(?:\D|$)", text_value)
+    if year_first_date:
+        try:
+            return datetime(*[int(part) for part in year_first_date.groups()]).strftime("%Y-%m-%d")
+        except ValueError:
+            return ""
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", text_value):
+        try:
+            return from_number(float(text_value))
+        except ValueError:
+            return ""
+
+    normalized_date = re.sub(r"\s*([./-])\s*", r"\1", text_value)
+    normalized_date = normalized_date.replace("년", "-").replace("월", "-").replace("일", "")
     try:
-        return datetime.strptime(normalized_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except (TypeError, ValueError):
+        parsed = pd.to_datetime(normalized_date, errors="raise")
+        return parsed.strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError):
         return ""
+
+def is_blank_excel_cell(value):
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip().lower() in ("", "nan", "none", "nat", "<na>")
 
 # ----------------------------------------------------
 # 2. Neon PostgreSQL 데이터베이스
@@ -1131,6 +1153,7 @@ def admin_menu_dialog():
         
         with t4:
             st.info("제품별 기준 색도 엑셀 파일을 업로드하여 시스템에 즉시 적용합니다.")
+            st.caption("적용시작일이 비어 있으면 해당 제품의 최초 생산일을 사용합니다. 생산기록이 없는 제품은 날짜를 직접 입력해야 합니다. 완전히 빈 행은 건너뜁니다.")
             h_up = st.file_uploader("제품 기준값/이력 엑셀 업로드", type=['xlsx','xls'], key="admin_file_history")
             if h_up and st.button("🚀 제품 기준값 전체 적용", key="admin_btn_upload_history"):
                 try:
@@ -1139,19 +1162,46 @@ def admin_menu_dialog():
                         prepared_rows = []
                         validation_errors = []
                         seen_keys = set()
+                        inferred_date_rows = []
+                        first_production_dates = {}
+                        if not history_df.empty:
+                            for product_name, product_rows in history_df.groupby('제품명'):
+                                product_dates = pd.to_datetime(product_rows['생산일'], errors='coerce').dropna()
+                                if not product_dates.empty:
+                                    first_production_dates[str(product_name).strip()] = product_dates.min().strftime("%Y-%m-%d")
+
                         for row_num, (_, r) in enumerate(df_h.iterrows(), start=2):
-                            product = str(r['제품명']).strip()
-                            if product.lower() in ('', 'nan', 'none'):
+                            raw_product = r['제품명']
+                            raw_effective_date = r['적용시작일']
+                            raw_target = r['기준색도']
+                            if all(is_blank_excel_cell(value) for value in (raw_product, raw_effective_date, raw_target)):
+                                continue
+
+                            product = "" if is_blank_excel_cell(raw_product) else str(raw_product).strip()
+                            if not product:
                                 validation_errors.append(f"{row_num}행: 제품명이 비어 있습니다.")
                                 continue
 
-                            effective_date = parse_excel_date(r['적용시작일'])
+                            effective_date = parse_excel_date(raw_effective_date)
                             if not effective_date:
-                                validation_errors.append(f"{row_num}행: 적용시작일을 날짜로 읽을 수 없습니다.")
-                                continue
+                                if is_blank_excel_cell(raw_effective_date):
+                                    effective_date = first_production_dates.get(product, "")
+                                    if effective_date:
+                                        inferred_date_rows.append(row_num)
+                                    else:
+                                        validation_errors.append(
+                                            f"{row_num}행: 적용시작일이 비어 있고 '{product}'의 생산기록이 없어 최초 생산일을 찾을 수 없습니다. 날짜를 입력해주세요."
+                                        )
+                                        continue
+                                else:
+                                    validation_errors.append(
+                                        f"{row_num}행: 적용시작일을 날짜로 읽을 수 없습니다. "
+                                        f"(읽은 값: {raw_effective_date!r}, 형식: {type(raw_effective_date).__name__})"
+                                    )
+                                    continue
 
                             try:
-                                target = float(r['기준색도'])
+                                target = float(raw_target)
                                 if not np.isfinite(target):
                                     raise ValueError("숫자가 아닙니다")
                             except (TypeError, ValueError):
@@ -1186,7 +1236,10 @@ def admin_menu_dialog():
                             finally:
                                 conn.close()
                             st.cache_data.clear()
-                            st.session_state['show_toast'] = "제품 기준값이 시스템 전체에 즉시 적용되었습니다!"
+                            toast_message = "제품 기준값이 시스템 전체에 즉시 적용되었습니다!"
+                            if inferred_date_rows:
+                                toast_message += f" 빈 적용시작일 {len(inferred_date_rows)}개 행은 각 제품의 최초 생산일을 사용했습니다."
+                            st.session_state['show_toast'] = toast_message
                             st.rerun()
                     else:
                         st.error("엑셀 파일에 '제품명', '적용시작일', '기준색도' 열이 포함되어 있어야 합니다.")
