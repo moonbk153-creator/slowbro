@@ -36,6 +36,7 @@ if 'show_toast' in st.session_state:
 EXCEL_FILE = 'data sheet.xlsx'
 EQUIPMENT_LIST = ["버닝", "태환 12kg", "프로밧 25kg", "뷸러 60kg", "뷸러 120kg"]
 SILO_NUMBER_OPTIONS = [""] + [f"{number}번" for number in range(1, 11)]
+DEFAULT_NEW_PRODUCT_EFFECTIVE_DATE = "2000-01-01"
 ADMIN_PASSWORD, ACCESS_PASSWORD = st.secrets["ADMIN_PASSWORD"], st.secrets["APP_PASSWORD"]
 
 def normalize_silo_number(value):
@@ -1152,10 +1153,13 @@ def admin_menu_dialog():
                     conn.close()
         
         with t4:
-            st.info("제품별 기준 색도 엑셀 파일을 업로드하여 시스템에 즉시 적용합니다.")
-            st.caption("적용시작일이 비어 있으면 해당 제품의 최초 생산일을 사용합니다. 생산기록이 없는 제품은 날짜를 직접 입력해야 합니다. 완전히 빈 행은 건너뜁니다.")
-            h_up = st.file_uploader("제품 기준값/이력 엑셀 업로드", type=['xlsx','xls'], key="admin_file_history")
-            if h_up and st.button("🚀 제품 기준값 전체 적용", key="admin_btn_upload_history"):
+            st.info("이 탭에는 기준값과 변경 이력을 함께 관리하는 ‘기준값이력.xlsx’ 파일을 업로드합니다. 신제품 등록과 기준 변경 모두 이 파일에서 관리합니다.")
+            st.caption("업로드 파일의 첫 행에는 ‘제품명’, ‘적용시작일’, ‘기준색도’ 열이 있어야 합니다. ‘data sheet.xlsx’는 변경 날짜가 없는 제품목록 파일이므로 올리지 마세요.")
+            st.caption("신제품은 적용시작일을 비워도 등록됩니다. 기존 기준 이력이 있으면 그 시작일을 유지하고, 없으면 생산기록의 최초 날짜를 사용합니다. 둘 다 없으면 기본 시작일 2000-01-01로 등록합니다.")
+            st.caption("기준 변경은 같은 제품의 새 행에 변경 날짜와 새 기준색도를 입력하세요. 이전 기준은 유지되어 변경 전후 생산기록에 각각 적용됩니다.")
+            st.caption("업로드 파일에 없는 기존 이력도 삭제되지 않습니다. 같은 제품·같은 적용일의 행을 다시 올리면 그 날짜의 기준색도만 갱신합니다.")
+            h_up = st.file_uploader("기준값 이력 파일 업로드 (기준값이력.xlsx)", type=['xlsx','xls'], key="admin_file_history")
+            if h_up and st.button("🚀 기준 이력 추가/갱신", key="admin_btn_upload_history"):
                 try:
                     df_h = pd.read_excel(h_up)
                     if all(c in df_h.columns for c in ['제품명','적용시작일','기준색도']):
@@ -1163,12 +1167,28 @@ def admin_menu_dialog():
                         validation_errors = []
                         seen_keys = set()
                         inferred_date_rows = []
+                        defaulted_new_product_rows = []
+                        reused_target_date_rows = []
                         first_production_dates = {}
                         if not history_df.empty:
                             for product_name, product_rows in history_df.groupby('제품명'):
                                 product_dates = pd.to_datetime(product_rows['생산일'], errors='coerce').dropna()
                                 if not product_dates.empty:
                                     first_production_dates[str(product_name).strip()] = product_dates.min().strftime("%Y-%m-%d")
+
+                        existing_target_dates = {}
+                        target_conn = get_db_conn()
+                        try:
+                            existing_target_rows = target_conn.execute(
+                                "SELECT product_name, effective_date FROM target_history ORDER BY effective_date ASC, id ASC"
+                            ).fetchall()
+                            for existing_product, existing_date in existing_target_rows:
+                                existing_product = "" if existing_product is None else str(existing_product).strip()
+                                parsed_existing_date = parse_excel_date(existing_date)
+                                if existing_product and parsed_existing_date and existing_product not in existing_target_dates:
+                                    existing_target_dates[existing_product] = parsed_existing_date
+                        finally:
+                            target_conn.close()
 
                         for row_num, (_, r) in enumerate(df_h.iterrows(), start=2):
                             raw_product = r['제품명']
@@ -1185,14 +1205,17 @@ def admin_menu_dialog():
                             effective_date = parse_excel_date(raw_effective_date)
                             if not effective_date:
                                 if is_blank_excel_cell(raw_effective_date):
-                                    effective_date = first_production_dates.get(product, "")
+                                    effective_date = existing_target_dates.get(product, "")
                                     if effective_date:
-                                        inferred_date_rows.append(row_num)
+                                        reused_target_date_rows.append(row_num)
                                     else:
-                                        validation_errors.append(
-                                            f"{row_num}행: 적용시작일이 비어 있고 '{product}'의 생산기록이 없어 최초 생산일을 찾을 수 없습니다. 날짜를 입력해주세요."
-                                        )
-                                        continue
+                                        effective_date = first_production_dates.get(product, "")
+                                        if effective_date:
+                                            inferred_date_rows.append(row_num)
+                                        else:
+                                            # 기존 방식처럼 신제품의 최초 기준을 기본 시작일로 등록합니다.
+                                            effective_date = DEFAULT_NEW_PRODUCT_EFFECTIVE_DATE
+                                            defaulted_new_product_rows.append(row_num)
                                 else:
                                     validation_errors.append(
                                         f"{row_num}행: 적용시작일을 날짜로 읽을 수 없습니다. "
@@ -1224,11 +1247,41 @@ def admin_menu_dialog():
                             conn = get_db_conn()
                             try:
                                 conn.execute("BEGIN IMMEDIATE")
-                                conn.execute("DELETE FROM target_history")
-                                conn.executemany(
-                                    "INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)",
-                                    prepared_rows
-                                )
+                                existing_key_rows = conn.execute(
+                                    "SELECT id, product_name, target_value, effective_date FROM target_history ORDER BY id ASC"
+                                ).fetchall()
+                                existing_by_key = {}
+                                for existing_id, existing_product, existing_target, existing_date in existing_key_rows:
+                                    key_date = parse_excel_date(existing_date)
+                                    if existing_product is not None and key_date:
+                                        existing_by_key[(str(existing_product).strip(), key_date)] = (
+                                            existing_id,
+                                            float(existing_target) if existing_target is not None else None,
+                                        )
+
+                                rows_to_insert = []
+                                rows_to_update = []
+                                unchanged_rows = 0
+                                for product, target, effective_date in prepared_rows:
+                                    key = (product, effective_date)
+                                    existing = existing_by_key.get(key)
+                                    if existing is None:
+                                        rows_to_insert.append((product, target, effective_date))
+                                    elif existing[1] is None or not np.isclose(existing[1], target, rtol=0, atol=1e-9):
+                                        rows_to_update.append((target, existing[0]))
+                                    else:
+                                        unchanged_rows += 1
+
+                                if rows_to_insert:
+                                    conn.executemany(
+                                        "INSERT INTO target_history (product_name, target_value, effective_date) VALUES (?, ?, ?)",
+                                        rows_to_insert,
+                                    )
+                                if rows_to_update:
+                                    conn.executemany(
+                                        "UPDATE target_history SET target_value=? WHERE id=?",
+                                        rows_to_update,
+                                    )
                                 conn.commit()
                             except Exception:
                                 conn.rollback()
@@ -1236,13 +1289,21 @@ def admin_menu_dialog():
                             finally:
                                 conn.close()
                             st.cache_data.clear()
-                            toast_message = "제품 기준값이 시스템 전체에 즉시 적용되었습니다!"
+                            toast_message = (
+                                f"기준 이력 적용 완료: 신규 {len(rows_to_insert)}건, "
+                                f"기준값 변경 {len(rows_to_update)}건, 기존과 동일 {unchanged_rows}건. "
+                                "업로드에 없는 기존 이력은 유지했습니다."
+                            )
                             if inferred_date_rows:
-                                toast_message += f" 빈 적용시작일 {len(inferred_date_rows)}개 행은 각 제품의 최초 생산일을 사용했습니다."
+                                toast_message += f" 날짜가 빈 {len(inferred_date_rows)}개 행은 최초 생산일을 사용했습니다."
+                            if reused_target_date_rows:
+                                toast_message += f" 생산기록이 없는 기존 제품 {len(reused_target_date_rows)}개 행은 기존 기준 시작일을 유지했습니다."
+                            if defaulted_new_product_rows:
+                                toast_message += f" 새 제품 {len(defaulted_new_product_rows)}개 행은 기본 시작일 2000-01-01로 등록했습니다."
                             st.session_state['show_toast'] = toast_message
                             st.rerun()
                     else:
-                        st.error("엑셀 파일에 '제품명', '적용시작일', '기준색도' 열이 포함되어 있어야 합니다.")
+                        st.error("‘기준값이력.xlsx’ 형식의 파일을 올려주세요. 첫 번째 행에 ‘제품명’, ‘적용시작일’, ‘기준색도’ 열이 있어야 합니다. ‘data sheet.xlsx’는 이 탭의 업로드 파일이 아닙니다.")
                 except Exception as e:
                     st.error(f"적용 중 오류 발생: {e}")
                     
